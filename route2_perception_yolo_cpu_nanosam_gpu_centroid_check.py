@@ -598,6 +598,7 @@ class SegmentationBackend(object):
         self.model_dir = model_dir
         self.last_instances = []
         self.last_accepted = []
+        self.last_debug_points = []
         self.conf = float(os.environ.get("YOLO_CONF", "0.25"))
         self.imgsz = int(os.environ.get("YOLO_IMGSZ", "1280"))
         self.mask_threshold = float(os.environ.get("SAM_MASK_THRESHOLD", "0.95"))
@@ -650,6 +651,7 @@ class SegmentationBackend(object):
             raise ValueError("RGB and aligned depth sizes disagree")
         self.last_instances = []
         self.last_accepted = []
+        self.last_debug_points = []
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         results = self.detector.predict(
             source=bgr, imgsz=self.imgsz, conf=self.conf,
@@ -678,23 +680,58 @@ class SegmentationBackend(object):
             point_labels = np.array([2, 3], dtype=np.int32)
             masks, _, _ = self.segmenter.predict(points, point_labels)
             mask = self._sam_mask(masks, h, w)
-            # Aligned depth must be valid for 3D reconstruction.
-            mask &= (depth > 0)
+            # Per-object diagnostics BEFORE the workspace crop. This is for
+            # visualization only: rejected objects must never be sent as valid
+            # manipulation coordinates.
+            raw_mask = np.asarray(mask, dtype=bool)
+            rgb_pixels = rgb[raw_mask]
+            mean_rgb = rgb_pixels.mean(axis=0) if len(rgb_pixels) else np.zeros(3)
+            mask = raw_mask & (depth > 0)
             instance = {"label": str(detector_label), "score": score,
                         "box": [x1, y1, x2, y2], "mask": mask,
+                        "mean_rgb_mask": mean_rgb.tolist(),
+                        "mask_pixels": int(raw_mask.sum()),
+                        "valid_depth_pixels": int(mask.sum()),
                         "reject_reason": "unprocessed"}
             idx = len(self.last_instances)
             self.last_instances.append(instance)
             if int(mask.sum()) < self.min_mask_pixels:
                 instance["reject_reason"] = "too few valid-depth mask pixels (%d)" % int(mask.sum())
                 continue
-            # Project only pixels inside this SAM mask, not the whole box.
             masked_depth = np.where(mask, depth, 0)
-            pts, colors = backproject(masked_depth, K, T, stride=2, rgb=rgb)
-            keep = self.config.crop_mask(pts)
-            pts, colors = pts[keep], colors[keep]
-            if len(pts) < self.config.min_points:
-                instance["reject_reason"] = "too few points in workspace (%d)" % len(pts)
+            pts_all, colors_all = backproject(masked_depth, K, T, stride=2, rgb=rgb)
+            if not np.isfinite(pts_all).all():
+                instance["reject_reason"] = "non-finite camera-to-base transform or depth points"
+                continue
+            if len(pts_all) == 0:
+                instance["reject_reason"] = "no backprojected 3D points"
+                continue
+            mins = pts_all.min(axis=0)
+            maxs = pts_all.max(axis=0)
+            instance["xyz_min_before_crop_m"] = np.round(mins, 4).tolist()
+            instance["xyz_max_before_crop_m"] = np.round(maxs, 4).tolist()
+            instance["xyz_mean_before_crop_m"] = np.round(pts_all.mean(axis=0), 4).tolist()
+            cfg = self.config
+            checks = {
+                "x": (pts_all[:, 0] > cfg.ws_x[0]) & (pts_all[:, 0] < cfg.ws_x[1]),
+                "y": (pts_all[:, 1] > cfg.ws_y[0]) & (pts_all[:, 1] < cfg.ws_y[1]),
+                "z_above_table": pts_all[:, 2] > cfg.table_z + cfg.table_cut,
+                "z_below_max": pts_all[:, 2] < cfg.z_max,
+            }
+            instance["crop_pass_counts"] = {k: int(v.sum()) for k, v in checks.items()}
+            keep = cfg.crop_mask(pts_all)
+            instance["before_crop"] = int(len(pts_all))
+            instance["after_crop"] = int(keep.sum())
+            self.last_debug_points.append((idx, pts_all[::max(1, len(pts_all)//4000)],
+                                           colors_all[::max(1, len(pts_all)//4000)]))
+            pts, colors = pts_all[keep], colors_all[keep]
+            if len(pts) < cfg.min_points:
+                instance["reject_reason"] = (
+                    "workspace crop kept %d/%d points (x=%d, y=%d, z>table=%d, z<max=%d)" %
+                    (len(pts), len(pts_all), instance["crop_pass_counts"]["x"],
+                     instance["crop_pass_counts"]["y"],
+                     instance["crop_pass_counts"]["z_above_table"],
+                     instance["crop_pass_counts"]["z_below_max"]))
                 continue
             # Existing geometry function computes hue, footprint yaw, extents,
             # point samples, and pick candidates for compatibility with RL.
@@ -1534,6 +1571,115 @@ def _debug_frame_from_server(host, port, timeout=30.0):
     return decode_frame(response)
 
 
+def render_pointcloud_3d(frame, backend, output_path, view=None, show=False):
+    """Read-only interactive 3D visualization, entirely on CPU.
+
+    Gray dots = downsampled entire RGB-D cloud in base_link.
+    Colored dots = segmented object points, BEFORE workspace filtering.
+    Large red star = most-red segmented candidate, even when crop rejected it.
+    Green diamond = accepted red target centroid, when one exists.
+    Orange wireframe = configured workspace. No coordinates here are sent
+    to the robot server; this is diagnostic only.
+    """
+    try:
+        import matplotlib
+        if not show:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise RuntimeError("Install matplotlib for --3d: python -m pip install matplotlib") from e
+    from mpl_toolkits.mplot3d import Axes3D  # noqa
+
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    pts, _ = backproject(frame["depth"], frame["intrinsics"],
+                         frame["cam_to_base"], stride=8)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if len(pts):
+        pts = pts[::max(1, len(pts)//15000)]
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                   s=0.4, alpha=0.13, c="gray", depthshade=False)
+    cfg = backend.config
+    wx0, wx1 = cfg.ws_x
+    wy0, wy1 = cfg.ws_y
+    wz0, wz1 = cfg.table_z + cfg.table_cut, cfg.z_max
+    for x in (wx0, wx1):
+        for y in (wy0, wy1):
+            ax.plot([x,x],[y,y],[wz0,wz1],color="darkorange",alpha=0.65)
+    for z in (wz0, wz1):
+        for y in (wy0, wy1):
+            ax.plot([wx0,wx1],[y,y],[z,z],color="darkorange",alpha=0.65)
+        for x in (wx0, wx1):
+            ax.plot([x,x],[wy0,wy1],[z,z],color="darkorange",alpha=0.65)
+
+    # Plot sampled SAM object point clouds independently from crop acceptance.
+    candidates = []
+    colors = ["royalblue", "deepskyblue", "magenta", "limegreen", "gold"]
+    for idx, xyz, rgb in backend.last_debug_points:
+        ax.scatter(xyz[:,0],xyz[:,1],xyz[:,2],s=5,
+                   c=[colors[idx % len(colors)]],alpha=0.6,
+                   depthshade=False)
+        inst = backend.last_instances[idx]
+        if len(xyz):
+            centroid = np.asarray(inst.get("xyz_mean_before_crop_m", xyz.mean(axis=0)), dtype=float)
+            mean_rgb = np.asarray(inst.get("mean_rgb_mask", [0,0,0]), dtype=float)
+            r,g,b = mean_rgb
+            # Only red-dominant masks can become a red-target candidate.
+            if r >= 45 and r >= 1.25*max(g,b):
+                chroma = mean_rgb / max(1., mean_rgb.sum())
+                dist = np.linalg.norm(chroma - [1.,0.,0.])
+                candidates.append((float(dist),idx,centroid))
+    if candidates:
+        _, idx, center = min(candidates, key=lambda x:x[0])
+        ax.scatter([center[0]],[center[1]],[center[2]],
+                   s=400, c="red", marker="*", edgecolors="black",
+                   linewidths=1.0, depthshade=False,
+                   label="Red candidate centroid (BEFORE crop)")
+        ax.text(center[0],center[1],center[2]+0.012,
+                "Red #%d XYZ %.3f %.3f %.3f" % (idx,*center),size=9)
+        print("[3D debug red candidate] instance=%d xyz_base_m=%s (pre-crop; NOT safe for motion)" %
+              (idx,np.round(center,4).tolist()))
+    else:
+        print("[3D debug] no red-dominant SAM mask found")
+    # Distinct marker for the final centroid passed to Route2 when accepted.
+    accepted = (view or {}).get("target")
+    if accepted is not None:
+        center = np.asarray(accepted["centroid"], dtype=float)
+        ax.scatter([center[0]], [center[1]], [center[2]],
+                   s=320, c="lime", marker="D", edgecolors="black",
+                   linewidths=1.0, depthshade=False,
+                   label="ACCEPTED red target centroid")
+        ax.text(center[0], center[1], center[2]+0.022,
+                "Accepted XYZ %.3f %.3f %.3f" % tuple(center), size=9)
+    ax.set_xlabel("base_link X (m)")
+    ax.set_ylabel("base_link Y (m)")
+    ax.set_zlabel("base_link Z (m)")
+    ax.set_title("RGB-D cloud (gray) | SAM blocks (colors) | red candidate (star)\n"
+                 "Orange wireframe = strict workspace crop. Rotate with mouse.")
+    # Include the workspace and the actual sampled cloud in the view, so
+    # wrongly transformed point clouds do not disappear off-screen.
+    bounds = [[wx0-0.05, wx1+0.05], [wy0-0.05, wy1+0.05],
+              [min(wz0-0.05, 0.0), wz1+0.05]]
+    if len(pts):
+        for dim in range(3):
+            low, high = np.percentile(pts[:, dim], [2, 98])
+            bounds[dim][0] = min(bounds[dim][0], low - 0.05)
+            bounds[dim][1] = max(bounds[dim][1], high + 0.05)
+    ax.set_xlim(*bounds[0])
+    ax.set_ylim(*bounds[1])
+    ax.set_zlim(*bounds[2])
+    ax.view_init(elev=27,azim=-60)
+    if candidates or accepted is not None:
+        ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(output_path,dpi=140)
+    print("[3D debug] saved",output_path)
+    if show:
+        plt.show(block=False)
+        plt.pause(0.25)
+    plt.close(fig)
+
+
 def _visualization_main():
     import argparse
     import json
@@ -1550,6 +1696,10 @@ def _visualization_main():
     parser.add_argument("--output-dir", default="perception_debug")
     parser.add_argument("--show", action="store_true",
                         help="Open an OpenCV window; press q to stop")
+    parser.add_argument("--3d", dest="make_3d", action="store_true",
+                        help="Save a CPU-rendered 3D RGB-D point cloud with workspace and red centroid")
+    parser.add_argument("--show-3d", action="store_true",
+                        help="Also open a rotatable matplotlib 3D window (implies --3d)")
     parser.add_argument("--count", type=int, default=1,
                         help="Number of frames; 0 for continuous (use --show)")
     parser.add_argument("--interval", type=float, default=0.5,
@@ -1594,6 +1744,10 @@ def _visualization_main():
         png_path = os.path.join(args.output_dir, stem + ".png")
         json_path = os.path.join(args.output_dir, stem + ".json")
         cv2.imwrite(png_path, annotated)
+        if args.make_3d or args.show_3d:
+            render_pointcloud_3d(frame, backend,
+                os.path.join(args.output_dir, stem + "_3d.png"),
+                view=view, show=args.show_3d)
         report = {
             "target_found": view["target_found"],
             "target_source": view["target_source"],
@@ -1620,7 +1774,9 @@ def _visualization_main():
                 obj.get("red_distance"), obj.get("target_reject_reason")))
         for idx, inst in enumerate(backend.last_instances):
             if inst.get("reject_reason"):
-                print("[3D reject] instance=%d: %s" % (idx, inst["reject_reason"]))
+                print("[3D reject] instance=%d: %s | xyz ranges=%s .. %s" % (
+                idx, inst["reject_reason"],
+                inst.get("xyz_min_before_crop_m"), inst.get("xyz_max_before_crop_m")))
         print("[target center] %s | xyz=%s | uv=%s | mask=%s | error_m=%s" % (
             verification["status"], verification.get("centroid_base_xyz_m"),
             verification.get("projected_pixel_uv"),
