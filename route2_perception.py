@@ -9,7 +9,7 @@ One RGB-D frame feeds two separate paths:
 
   Route 1 (into the policy):  raw RGB + depth pixels -> phi_s -> actor/critic.
                               No centroids, no labels, no object identity.
-  Route 2 (this file):        YOLO + NanoSAM + DINOv2 -> per-object centroids
+  Route 2 (this file):        YOLO bounding boxes + depth geometry -> per-object centroids
                               in the base frame.
 
 Route 2 does exactly two jobs, and nothing else:
@@ -87,10 +87,7 @@ logs. No extra rule is layered on to patch them; measure first.
 
 Backends
 --------
-  "dino"      : the real one. Wraps the lab pipeline from
-                semantics_dinov2_depth_integrator.py (YOLOv8 boxes ->
-                NanoSAM masks -> DINOv2 RGB-D fusion classifier). Plug the
-                lab code into DinoBackend.recognize().
+  "segmentation": YOLO bounding boxes + filtered RGB-D geometry (no SAM).
   "geometric" : no learned parts. Back-project depth, crop to the table,
                 cluster, name each cluster by its dominant hue. Exists so the
                 whole path runs today and can be tested against the mock
@@ -575,148 +572,104 @@ class GeometricBackend(object):
 
 
 class SegmentationBackend(object):
-    """YOLO bounding boxes -> NanoSAM instance masks -> calibrated 3D objects.
+    """YOLO-only detector with calibrated RGB-D object geometry.
 
-    Runs on the Jetson/training machine, not inside the robot's Python 3.6
-    environment. Uses the same Predictor interface as the supplied lab node.
-
-    Environment configuration:
-      YOLO_WEIGHTS            detector .pt path (default yolov8n.pt)
-      YOLO_CONF               detection probability (default 0.25)
-      YOLO_IMGSZ              inference input size (default 1280)
-      NANOSAM_ENCODER_ENGINE  TensorRT encoder .engine path
-      NANOSAM_DECODER_ENGINE  TensorRT decoder .engine path
-      PERCEPTION_MIN_MASK_PIXELS  minimum mask area (default 25)
-
-    This implementation creates new instance masks on EVERY frame and does not
-    reuse the lab node's initial-frame object IDs (which lost pushed objects).
+    Compatible with existing make_backend("segmentation", ...) training code.
+    No SAM, NanoSAM, TensorRT engine, or CuPy dependency.
+    Uses YOLO bounding boxes as candidate ROIs and keeps depth pixels above
+    the table inside each box. Boxes are NOT instance segmentation masks.
     """
 
     name = "segmentation"
 
     def __init__(self, config, model_dir=None):
         import os
-        import torch
         from ultralytics import YOLO
-        from nanosam.utils.predictor import Predictor
-
         self.config = config
         self.model_dir = model_dir
-        self.last_instances = []  # YOLO boxes and SAM masks for diagnostics
-        self.last_accepted = []   # indices passing the 3D geometry filters
-        self.torch = torch
-        self.conf = float(os.environ.get("YOLO_CONF", "0.25"))
-        self.imgsz = int(os.environ.get("YOLO_IMGSZ", "1280"))
-        self.min_mask_pixels = int(os.environ.get(
-            "PERCEPTION_MIN_MASK_PIXELS", "25"))
-        if not (0.0 < self.conf <= 1.0):
-            raise ValueError("YOLO_CONF must be in (0, 1]")
-        weights = os.environ.get("YOLO_WEIGHTS", "yolov8n.pt")
-        encoder = os.environ.get(
-            "NANOSAM_ENCODER_ENGINE",
-            "/home/smartslab_jetson_xavier/nanosam/data/resnet18_image_encoder.engine")
-        decoder = os.environ.get(
-            "NANOSAM_DECODER_ENGINE",
-            "/home/smartslab_jetson_xavier/nanosam/data/mobile_sam_mask_decoder.engine")
-        for path in (encoder, decoder):
-            if not os.path.isfile(path):
-                raise FileNotFoundError("NanoSAM TensorRT engine not found: " + path)
-        self.detector = YOLO(weights)
-        self.segmenter = Predictor(
-            image_encoder_engine=encoder,
-            mask_decoder_engine=decoder)
-
-    def recognize(self, rgb, depth_mm):
-        """Return (YOLO class name, confidence, independent boolean mask).
-
-        RGB is converted to BGR for Ultralytics' numpy-array interface; the
-        NanoSAM predictor receives a PIL RGB image, as in the lab pipeline.
-        """
-        import cv2
-        from PIL import Image as PILImage
-
         self.last_instances = []
         self.last_accepted = []
-        h, w = rgb.shape[:2]
-        if depth_mm.shape != (h, w):
-            raise ValueError("RGB and aligned depth must have the same shape")
-        bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
-        with self.torch.no_grad():
-            results = self.detector.predict(
-                source=bgr, imgsz=self.imgsz, conf=self.conf,
-                verbose=False)
-            if not results or len(results[0].boxes) == 0:
-                return []
-            self.segmenter.set_image(PILImage.fromarray(rgb))
-            detections = []
-            names = results[0].names
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = map(float, box.xyxy[0].cpu().tolist())
-                x1, x2 = sorted((max(0., min(x1, w - 1.)),
-                                 max(0., min(x2, w - 1.))))
-                y1, y2 = sorted((max(0., min(y1, h - 1.)),
-                                 max(0., min(y2, h - 1.))))
-                if x2 - x1 < 2 or y2 - y1 < 2:
-                    continue
-                prompts = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-                labels = np.array([2, 3], dtype=np.int32)  # NanoSAM box corners
-                high_res_masks, _, _ = self.segmenter.predict(prompts, labels)
-                masks = high_res_masks
-                if isinstance(masks, (list, tuple)):
-                    masks = masks[0]
-                if hasattr(masks, "detach"):
-                    masks = masks.detach().float().cpu().numpy()
-                masks = np.asarray(masks)
-                while masks.ndim > 2:
-                    masks = masks[0]
-                if masks.shape != (h, w):
-                    masks = cv2.resize(masks.astype(np.float32), (w, h),
-                                       interpolation=cv2.INTER_LINEAR)
-                mask = (masks > 0.95)
-                # Filter non-depth pixels early; backprojection will also crop.
-                mask &= (depth_mm > 0)
-                if np.count_nonzero(mask) < self.min_mask_pixels:
-                    continue
-                cls_id = int(box.cls.item())
-                label = (names.get(cls_id, str(cls_id))
-                         if isinstance(names, dict)
-                         else names[cls_id])
-                confidence = float(box.conf.item())
-                self.last_instances.append({
-                    "label": str(label), "score": confidence,
-                    "box": [x1, y1, x2, y2], "mask": mask.copy(),
-                })
-                detections.append((str(label), confidence, mask))
-            return detections
+        self.conf = float(os.environ.get("YOLO_CONF", "0.25"))
+        self.imgsz = int(os.environ.get("YOLO_IMGSZ", "640"))
+        self.min_depth_points = int(os.environ.get(
+            "PERCEPTION_MIN_DEPTH_POINTS", "25"))
+        self.weights = os.environ.get("YOLO_WEIGHTS", "yolov8n.pt")
+        self.detector = YOLO(self.weights)
 
     def detect(self, frame):
-        """Convert per-instance masks to the same 3D metadata as geometry mode.
-
-        Computing HSV/footprint data here keeps Route2Perception's default
-        identity='color' usable for the red-target/green-obstacle experiment.
-        No inference-time tracking IDs or static masks are required.
-        """
-        cfg = self.config
-        rgb = frame["rgb"]
-        depth = frame["depth"]
-        K = frame["intrinsics"]
-        T = frame["cam_to_base"]
+        import cv2
+        rgb = np.asarray(frame["rgb"], dtype=np.uint8)
+        depth = np.asarray(frame["depth"], dtype=np.uint16)
+        K = np.asarray(frame["intrinsics"], dtype=float)
+        T = np.asarray(frame["cam_to_base"], dtype=float)
+        h, w = depth.shape
+        if rgb.shape[:2] != (h, w):
+            raise ValueError("RGB and aligned depth must have the same shape")
+        self.last_instances = []
+        self.last_accepted = []
+        bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+        results = self.detector.predict(source=bgr, imgsz=self.imgsz,
+                                        conf=self.conf, verbose=False)
         detections = []
-        for instance_index, (label, score, mask) in enumerate(
-                self.recognize(rgb, depth)):
-            masked_depth = np.where(mask, depth, 0)
-            pts, colors = backproject(masked_depth, K, T, stride=2, rgb=rgb)
-            keep = cfg.crop_mask(pts)
-            pts, colors = pts[keep], colors[keep]
-            if len(pts) < cfg.min_points:
+        if not results:
+            return detections
+        result = results[0]
+        names = result.names
+        for box in result.boxes:
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].cpu().tolist()]
+            x1 = max(0, min(w, int(np.floor(x1))))
+            x2 = max(0, min(w, int(np.ceil(x2))))
+            y1 = max(0, min(h, int(np.floor(y1))))
+            y2 = max(0, min(h, int(np.ceil(y2))))
+            if x2 - x1 < 2 or y2 - y1 < 2:
                 continue
-            entry = GeometricBackend._detection(pts, colors)
+            cls_id = int(box.cls.item())
+            label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else names[cls_id]
+            score = float(box.conf.item())
+            # Sample depth within YOLO box and transform into base_link.
+            # Workspace/table crop discards most background behind a block.
+            yy, xx = np.mgrid[y1:y2:2, x1:x2:2]
+            z = depth[yy, xx].astype(np.float64) / 1000.0
+            ok = (z > 0.05)
+            xx, yy, z = xx[ok], yy[ok], z[ok]
+            instance = {"label": str(label), "score": score,
+                        "box": [x1, y1, x2, y2],
+                        "mask": np.zeros((h, w), dtype=bool)}
+            idx = len(self.last_instances)
+            self.last_instances.append(instance)
+            if len(z) == 0:
+                continue
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            xyz_cam = np.column_stack(((xx - cx) * z / fx,
+                                       (yy - cy) * z / fy, z,
+                                       np.ones_like(z)))
+            xyz_base = xyz_cam.dot(T.T)[:, :3]
+            ok_workspace = self.config.crop_mask(xyz_base)
+            xyz_base = xyz_base[ok_workspace]
+            xx, yy = xx[ok_workspace], yy[ok_workspace]
+            if len(xyz_base) < self.min_depth_points:
+                continue
+            # Robustly select the closest coherent object-sized point cluster.
+            # Reject unrelated background that survives the workspace crop.
+            clusters = cluster_points(xyz_base, self.config.voxel,
+                                      self.config.min_points)
+            if not clusters:
+                continue
+            # Prefer the largest coherent component in the box.
+            indices = clusters[0]
+            pts = xyz_base[indices]
+            rgb_pts = rgb[yy[indices], xx[indices]]
+            if len(pts) < self.min_depth_points:
+                continue
+            entry = GeometricBackend._detection(pts, rgb_pts)
             if entry is None:
                 continue
-            entry["score"] = float(score)
-            entry["detector_label"] = label
-            entry["instance_index"] = instance_index
-            self.last_accepted.append(instance_index)
+            instance["mask"][yy[indices], xx[indices]] = True
+            entry["score"] = score
+            entry["detector_label"] = str(label)
+            entry["instance_index"] = idx
+            self.last_accepted.append(idx)
             detections.append(entry)
         return detections
 
@@ -1309,7 +1262,7 @@ def grasp_feasibility(view, clearance_min=0.06, max_radial=0.38,
 # ---------------- read-only perception visualization ----------------
 # Invoke this file directly to debug detection without executing robot motions.
 def render_perception_debug(frame, view, backend, feasibility=None):
-    """Draw YOLO boxes, NanoSAM masks, target/obstacle IDs and XYZ in metres.
+    """Draw YOLO boxes, supported depth pixels, target/obstacle IDs and XYZ.
 
     Returns a BGR uint8 image suitable for cv2.imshow or cv2.imwrite.
     Requires OpenCV only when visualization is requested.
@@ -1370,7 +1323,7 @@ def render_perception_debug(frame, view, backend, feasibility=None):
                         color, 1, cv2.LINE_AA)
 
     found = view.get("target") is not None
-    info = "YOLO+NanoSAM: %d masks | %d 3D objects | target: %s (%s)" % (
+    info = "YOLO only: %d boxes | %d 3D objects | target: %s (%s)" % (
         len(instances), len(accepted), "YES" if found else "NO",
         view.get("target_source", "unknown"))
     if feasibility is not None:
@@ -1402,7 +1355,7 @@ def _visualization_main():
     import time
     import cv2
     parser = argparse.ArgumentParser(
-        description="Visualize YOLO+NanoSAM without moving the robot")
+        description="Visualize YOLO-only perception without moving the robot")
     parser.add_argument("--host", default="127.0.0.1",
                         help="LoCoBot server IP (port 9999)")
     parser.add_argument("--port", type=int, default=9999)
@@ -1451,18 +1404,18 @@ def _visualization_main():
             "target_source": view["target_source"],
             "target": view["target"],
             "obstacles": view["obstacles"],
-            "num_yolo_sam_masks": len(backend.last_instances),
+            "num_yolo_boxes": len(backend.last_instances),
             "num_accepted_3d_objects": len(backend.last_accepted),
             "grasp_feasibility": feasibility,
         }
         with open(json_path, "w") as f:
             json.dump(report, f, indent=2)
-        print("[perception] %s | masks=%d accepted=%d target=%s graspable=%s" % (
+        print("[perception] %s | boxes=%d accepted=%d target=%s graspable=%s" % (
             png_path, len(backend.last_instances),
             len(backend.last_accepted), view["target_found"],
             feasibility["graspable"]))
         if args.show:
-            cv2.imshow("YOLO + NanoSAM perception (q to quit)", annotated)
+            cv2.imshow("YOLO-only perception (q to quit)", annotated)
             if cv2.waitKey(1 if args.count == 0 else 100) & 0xFF == ord("q"):
                 break
         i += 1
