@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 from mpl_toolkits.mplot3d import Axes3D
 
-import route2_perception_yolo_cpu_nanosam_gpu_centroid_check as p
+import route2_perception as p
 
 
 def draw_workspace(ax, cfg):
@@ -42,7 +42,8 @@ def main():
     parser.add_argument("--host", default="locobot.local")
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--output-dir", default="debug_3d")
-    parser.add_argument("--show-3d", action="store_true")
+    parser.add_argument("--show", "--show-3d", dest="show_3d", action="store_true")
+    parser.add_argument("--count", type=int, default=1)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -95,10 +96,11 @@ def main():
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
 
+    # Complete RGB-D cloud, before workspace crop
     cloud, colors = p.backproject(
-    depth, K, T,
-    stride=1,
-    rgb=rgb
+        depth, K, T,
+        stride=8,
+        rgb=rgb
     )
 
     finite = np.isfinite(cloud).all(axis=1)
@@ -122,7 +124,7 @@ def main():
               np.round(cloud.max(axis=0), 3))
 
     # Workspace boundaries
-    draw_workspace(ax, cfg)
+    #draw_workspace(ax, cfg)
 
     # Collect red candidates independently of rejection
     red_candidates = []
@@ -140,7 +142,7 @@ def main():
 
         xyz, rgb_points = p.backproject(
             masked_depth, K, T,
-            stride=1,
+            stride=2,
             rgb=rgb
         )
 
@@ -189,8 +191,10 @@ def main():
         print("Z below max:", int(z_max_pass.sum()))
 
         # Draw each segmented object in its actual RGB color
-        sample_xyz = xyz
-        sample_rgb = rgb_points / 255.0
+        step = max(1, len(xyz) // 3000)
+
+        sample_xyz = xyz[::step]
+        sample_rgb = rgb_points[::step] / 255.0
 
         ax.scatter(
             sample_xyz[:, 0],
