@@ -555,6 +555,7 @@ class GeometricBackend(object):
             "label": hue_label(rgb_mean),
             "hue": h * 360.0,
             "sat": sat,
+            "mean_rgb": [float(v) for v in rgb_mean],
             "score": 1.0,
             "centroid": centroid.tolist(),
             "extent": extent.tolist(),
@@ -680,10 +681,12 @@ class SegmentationBackend(object):
             # Aligned depth must be valid for 3D reconstruction.
             mask &= (depth > 0)
             instance = {"label": str(detector_label), "score": score,
-                        "box": [x1, y1, x2, y2], "mask": mask}
+                        "box": [x1, y1, x2, y2], "mask": mask,
+                        "reject_reason": "unprocessed"}
             idx = len(self.last_instances)
             self.last_instances.append(instance)
             if int(mask.sum()) < self.min_mask_pixels:
+                instance["reject_reason"] = "too few valid-depth mask pixels (%d)" % int(mask.sum())
                 continue
             # Project only pixels inside this SAM mask, not the whole box.
             masked_depth = np.where(mask, depth, 0)
@@ -691,12 +694,17 @@ class SegmentationBackend(object):
             keep = self.config.crop_mask(pts)
             pts, colors = pts[keep], colors[keep]
             if len(pts) < self.config.min_points:
+                instance["reject_reason"] = "too few points in workspace (%d)" % len(pts)
                 continue
             # Existing geometry function computes hue, footprint yaw, extents,
             # point samples, and pick candidates for compatibility with RL.
             entry = GeometricBackend._detection(pts, colors)
             if entry is None:
+                extent = np.ptp(pts, axis=0)
+                instance["reject_reason"] = "3D extent rejected (m): %s" % np.round(extent, 3).tolist()
                 continue
+            instance["reject_reason"] = None
+            instance["mean_rgb"] = entry["mean_rgb"]
             entry["score"] = score
             entry["detector_label"] = str(detector_label)
             entry["instance_index"] = idx
@@ -882,22 +890,43 @@ class Route2Perception(object):
         return index
 
     def _pick_by_label(self, detections):
-        """Index of the detection that is the colour target, else None.
+        """For red-target scenes, choose the most red *accepted* 3D object.
 
-        Order of rules:
-          1. Hue OUTLIER: the detection whose colour stands apart from
-             every other coloured detection (>=60 deg from its nearest
-             neighbour). This is the task's own definition of the target
-             and needs no fixed colour at all.
-          2. Fallback when there is nothing to compare against (fewer
-             than two coloured detections): nearest to the episode's
-             remembered target hue within hue_tol; before the first
-             sighting, the hue seeded by target_label.
-          3. Hue-less backends: exact label match, biggest cluster.
-        A merged pile fails all three - its mixed hue is neither an
-        outlier against the remaining obstacles nor near the remembered
-        target hue - and that failure is the policy's push-things-apart
-        signal, on purpose."""
+        RGB is averaged over the SAM-masked, workspace-filtered depth points,
+        rather than a bounding box. A relative redness score orders candidates,
+        but a minimum red-dominance gate prevents choosing a green object when
+        the red target is occluded. No position fallback is used.
+        """
+        if self.target_label == "red_object":
+            import os
+            min_ratio = float(os.environ.get("RED_DOMINANCE_RATIO", "1.25"))
+            min_red = float(os.environ.get("RED_MIN_CHANNEL", "45"))
+            candidates = []
+            for i, d in enumerate(detections):
+                if not self._extent_ok(d):
+                    d["target_reject_reason"] = "target footprint exceeds maximum"
+                    continue
+                rgb = d.get("mean_rgb")
+                if rgb is None:
+                    d["target_reject_reason"] = "missing mean RGB"
+                    continue
+                r, g, b = [float(x) for x in rgb]
+                if r < min_red or r < min_ratio * max(g, b):
+                    d["target_reject_reason"] = "not sufficiently red"
+                    continue
+                # Higher normalized redness means closer to pure red [1,0,0]
+                # after removing overall brightness differences.
+                chroma = np.array([r, g, b], dtype=float) / max(r + g + b, 1.0)
+                red_distance = float(np.linalg.norm(chroma - [1.0, 0.0, 0.0]))
+                d["red_distance"] = red_distance
+                candidates.append((red_distance, -r, i))
+            if not candidates:
+                return None
+            index = min(candidates)[2]
+            self.episode_hue = float(detections[index].get("hue", 0.0))
+            return index
+
+        # Preserve the original behavior for other target colors.
         index = hue_outlier(detections)
         if index is not None and not self._extent_ok(detections[index]):
             index = None
@@ -1318,13 +1347,19 @@ def render_perception_debug(frame, view, backend, feasibility=None):
         x1, y1, x2, y2 = [int(v) for v in instance["box"]]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         state = "3D OK" if i in accepted else "3D REJECTED"
-        label = "#%d %s %.2f %s" % (i, instance["label"],
-                                   instance["score"], state)
+        rgb_text = (" RGB=%d,%d,%d" % tuple(int(round(v)) for v in instance["mean_rgb"])) \
+            if "mean_rgb" in instance else ""
+        label = "#%d %s %.2f %s%s" % (i, instance["label"],
+                                      instance["score"], state, rgb_text)
         ytext = max(22, y1 - 8)
         cv2.putText(out, label, (max(0, x1), ytext), font, 0.47,
                     (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(out, label, (max(0, x1), ytext), font, 0.47,
                     color, 1, cv2.LINE_AA)
+        if i not in accepted:
+            reason = str(instance.get("reject_reason") or "unknown")
+            cv2.putText(out, reason[:75], (max(0, x1), min(out.shape[0]-8, y2+20)),
+                        font, 0.42, (0, 0, 255), 1, cv2.LINE_AA)
 
     # Project base-frame centroids back to pixels for coordinate labels.
     K = np.asarray(frame["intrinsics"], dtype=float)
@@ -1566,6 +1601,9 @@ def _visualization_main():
             "obstacles": view["obstacles"],
             "num_yolo_boxes": len(backend.last_instances),
             "num_accepted_3d_objects": len(backend.last_accepted),
+            "instances": [{k: v for k, v in inst.items() if k != "mask"}
+                          for inst in backend.last_instances],
+            "detections": view.get("detections", []),
             "grasp_feasibility": feasibility,
             "target_centroid_verification": verification,
         }
@@ -1575,6 +1613,14 @@ def _visualization_main():
             png_path, len(backend.last_instances),
             len(backend.last_accepted), view["target_found"],
             feasibility["graspable"]))
+        for obj in view.get("detections", []):
+            print("[red ranking] instance=%s mean_RGB=%s red_distance=%s rejection=%s" % (
+                obj.get("instance_index"),
+                [round(x, 1) for x in obj.get("mean_rgb", [])],
+                obj.get("red_distance"), obj.get("target_reject_reason")))
+        for idx, inst in enumerate(backend.last_instances):
+            if inst.get("reject_reason"):
+                print("[3D reject] instance=%d: %s" % (idx, inst["reject_reason"]))
         print("[target center] %s | xyz=%s | uv=%s | mask=%s | error_m=%s" % (
             verification["status"], verification.get("centroid_base_xyz_m"),
             verification.get("projected_pixel_uv"),
