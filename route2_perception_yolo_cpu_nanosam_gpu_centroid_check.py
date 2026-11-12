@@ -95,11 +95,10 @@ def main():
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Complete RGB-D cloud, before workspace crop
     cloud, colors = p.backproject(
-        depth, K, T,
-        stride=8,
-        rgb=rgb
+    depth, K, T,
+    stride=1,
+    rgb=rgb
     )
 
     finite = np.isfinite(cloud).all(axis=1)
@@ -141,7 +140,7 @@ def main():
 
         xyz, rgb_points = p.backproject(
             masked_depth, K, T,
-            stride=2,
+            stride=1,
             rgb=rgb
         )
 
@@ -190,10 +189,8 @@ def main():
         print("Z below max:", int(z_max_pass.sum()))
 
         # Draw each segmented object in its actual RGB color
-        step = max(1, len(xyz) // 3000)
-
-        sample_xyz = xyz[::step]
-        sample_rgb = rgb_points[::step] / 255.0
+        sample_xyz = xyz
+        sample_rgb = rgb_points / 255.0
 
         ax.scatter(
             sample_xyz[:, 0],
