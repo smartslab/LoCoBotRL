@@ -60,11 +60,8 @@ import numpy as np
 
 import route2_perception as R
 
-MIN_BUILD = "2026-10-14b"
-SCAN_HEIGHTS = (0.07, 0.04)   # above the table, visited top down. The
-# primitives need +0.04 (push approach) and +0.06..0.07 (pre-grasp,
-# lift); +0.10 was dropped on Oct 22: it was never needed and every
-# extra extended hold loads the elbow motor (joint_3 Overload).
+MIN_BUILD = "2026-10-29d"   # MIN_RADIAL, TARGET_MAX_EXTENT on the server
+SCAN_HEIGHTS = (0.10, 0.07, 0.04)   # above the table, visited top down
 GRASP_DEPTHS = (-0.012, -0.020, -0.025)   # GRASP_DZ ladder, shallow first
 R_REF = 0.30
 TABLE_MIN_Z, TABLE_MAX_Z = 0.05, 0.40   # a table top is between these
@@ -485,6 +482,32 @@ def fingertip_spots(table, home_xy, count=6):
     return spread(pts, first, count, 0.04)
 
 
+def table_outline(table):
+    """Outline of the table top the camera sees (convex hull of the table
+    map, robot frame, metres), stored with the calibration. The server
+    uses it to keep pushed blocks ON THE TABLE: the work-area box is a
+    rectangle and, with the table standing at an angle to the robot, its
+    corners lie off the table."""
+    pts = np.asarray(table["grid"].cells(), dtype=float)
+    pts = sorted(set((round(float(x), 3), round(float(y), 3))
+                     for x, y in pts))
+    if len(pts) < 3:
+        return []
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return [list(p) for p in lower[:-1] + upper[:-1]]   # counter-clockwise
+
+
 def plan_workspace(table, r_lo, r_max, home_xy, edge=0.01, box=None):
     """Table area the arm can reach -> everything the server and the
     training script need to know about where things are.
@@ -498,7 +521,7 @@ def plan_workspace(table, r_lo, r_max, home_xy, edge=0.01, box=None):
         xs = np.arange(box[0], box[1] + 0.005, 0.01)
         ys = np.arange(box[2], box[3] + 0.005, 0.01)
         pts = np.array([[x, y] for x in xs for y in ys
-                        if np.hypot(x, y) <= r_max])
+                        if r_lo <= np.hypot(x, y) <= r_max])
     else:
         cells = grid.cells()
         xs = np.arange(np.floor(cells[:, 0].min() * 100) / 100,
@@ -506,7 +529,7 @@ def plan_workspace(table, r_lo, r_max, home_xy, edge=0.01, box=None):
         ys = np.arange(np.floor(cells[:, 1].min() * 100) / 100,
                        cells[:, 1].max() + 0.005, 0.01)
         pts = np.array([[x, y] for x in xs for y in ys
-                        if np.hypot(x, y) <= r_max
+                        if r_lo <= np.hypot(x, y) <= r_max
                         and grid.supported(x, y, edge)])
     if len(pts) < 60:
         raise Stop("the table area the camera sees and the area the arm "
@@ -536,7 +559,13 @@ def plan_workspace(table, r_lo, r_max, home_xy, edge=0.01, box=None):
                    "closer to the table." % len(band))
     anchor = band[np.argmin(np.linalg.norm(band - band.mean(axis=0),
                                            axis=1))]
-    drop = band[np.argmax(np.linalg.norm(band - anchor, axis=1))]
+    # the drop point is visited with a block in the jaw: keep it 6 cm
+    # inside the far reach limit and 4 cm outside the near one
+    rb = np.hypot(band[:, 0], band[:, 1])
+    safe = band[(rb <= r_max - 0.06) & (rb >= r_lo + 0.04)]
+    if len(safe) == 0:
+        safe = band
+    drop = safe[np.argmax(np.linalg.norm(safe - anchor, axis=1))]
     # places to test the grasp at, spread out and away from the drop point
     spots = spread(band[np.linalg.norm(band - drop, axis=1) > 0.07],
                    anchor, 5, 0.05)
@@ -560,12 +589,18 @@ def workspace_values(ws, release=None):
         "WS_X_MIN": ws["box"]["x_min"], "WS_X_MAX": ws["box"]["x_max"],
         "WS_Y_MIN": ws["box"]["y_min"], "WS_Y_MAX": ws["box"]["y_max"],
         "WS_Z_MAX": z + 0.20, "SAFE_Z_MIN": z + 0.025,
-        "HARD_Z_MIN": z - 0.005, "PUSH_EE_Z": z + 0.02,
+        # push height: fingertips 1 cm above the table (chosen on the robot
+        # on Oct 28 after trying 2 and 3 cm). Change it later with
+        # set_params.py PUSH_EE_Z=<table height + gap>.
+        "HARD_Z_MIN": z - 0.005, "PUSH_EE_Z": z + 0.01,
         "TARGET_X": round(ws["anchor"][0], 3),
         "TARGET_Y": round(ws["anchor"][1], 3),
         "RELEASE_X": round(release[0], 3), "RELEASE_Y": round(release[1], 3),
         "DROP_X": round(ws["drop"][0], 3), "DROP_Y": round(ws["drop"][1], 3),
         "MAX_RADIAL": ws["r_max"],
+        # inner reach limit: nothing is pushed or grasped closer than this
+        # (the near table edge, where the arm hit the table going home)
+        "MIN_RADIAL": round(min(ws["r_lo"], ws["r_max"] - 0.05), 2),
         # the lower fingertip must clear the HIGHEST part of the table in
         # the workspace, not just its height at the centre
         "FINGER_TABLE_MARGIN": min(0.004 + max(ws["tilt_high"], 0.0), 0.015),
@@ -839,10 +874,6 @@ def reach_scan(robot, cfg, direction, pitches):
         usable, first_bad = None, None
         for radial in coarse:
             row = probe(radial, pitch)
-            # Park between rungs: a far rung is held with the arm stretched
-            # out, and holding that through several heights is what tripped
-            # the elbow motor's overload protection on Oct 10.
-            robot.home()
             if row is None:        # left the box on the far side
                 first_bad = radial
                 break
@@ -1063,7 +1094,7 @@ def measure_fingertips(robot, cfg, table, xyz, pitch, args, tag):
 def look_at_spots(robot, cfg, table, spots, pitch, args, tag, samples,
                   repeat_first=False):
     """Measure the fingertips at each spot; append the usable samples."""
-    used = 0
+    used, refused_in_row = 0, 0
     for i, spot in enumerate(spots):
         xyz = [float(spot[0]), float(spot[1]), cfg["TABLE_Z"] + args.hover]
         for rep in range(2 if (repeat_first and i == 0) else 1):
@@ -1072,7 +1103,22 @@ def look_at_spots(robot, cfg, table, spots, pitch, args, tag, samples,
             where = "(%.2f, %.2f)" % (xyz[0], xyz[1])
             if not m["ok"]:
                 say("  %s: not usable - %s" % (where, m["reason"]))
+                refused_in_row += 1
+                # Park before the next spot: never start the next move
+                # from wherever a refused one left the arm.
+                robot.home()
+                if refused_in_row >= 2:
+                    raise Stop(
+                        "two moves in a row were refused, the last at %s, "
+                        "radial %.2f m, inside the reach measured in step "
+                        "3. That usually means a motor went into its "
+                        "overload/error state and now refuses every "
+                        "command, not that the spot is out of reach. Look "
+                        "at the server terminal for 'Overload' or "
+                        "'hardware error', power-cycle the arm, and run "
+                        "again." % (where, float(np.hypot(xyz[0], xyz[1]))))
                 break
+            refused_in_row = 0
             m["spot"] = [round(xyz[0], 3), round(xyz[1], 3)]
             samples.append(m)
             used += 1
@@ -1306,29 +1352,52 @@ def place_request(ws, cfg, why):
 # ---------------- step 6: output ----------------
 
 def training_commands(args, cfg, max_extent):
+    """The training commands. They carry NO geometry: the training script
+    reads table height, work area, anchor, reach limits, grasp circle and
+    target size from the server, which has them stored. A copy-pasted
+    number can therefore never disagree with the robot."""
     stamp = datetime.datetime.now().strftime("%m%d")
-    flags = ("--table_z %.3f --ws_x_min %.2f --ws_x_max %.2f "
-             "--ws_y_min %.2f --ws_y_max %.2f --anchor \"%.2f,%.2f\" "
-             "--max_radial %.2f"
-             % (cfg["TABLE_Z"], cfg["WS_X_MIN"], cfg["WS_X_MAX"],
-                cfg["WS_Y_MIN"], cfg["WS_Y_MAX"], cfg["TARGET_X"],
-                cfg["TARGET_Y"], cfg["MAX_RADIAL"]))
-    if max_extent > 0.0851:
-        flags += " --target_max_extent %.2f" % max_extent
-    common = ("--host %s --perception geometric --identity color "
-              "--target_label red_object \\\n  %s" % (args.host, flags))
+    host = "--host %s" % args.host
     if args.port != 9999:
-        common = "--port %d %s" % (args.port, common)
-    check = ("python3 train_two_pipeline_clutter.py \\\n  %s \\\n  "
-             "--steps 12 --warmup 12 --log_dir logs_random_%s"
-             % (common, stamp))
-    train = ("python3 train_two_pipeline_clutter.py \\\n  %s \\\n  "
-             "--steps 400 --warmup 30 --utd 20 --batch 256 \\\n  "
+        host += " --port %d" % args.port
+    check = ("python3 train_two_pipeline_clutter.py %s "
+             "--allow_pick 0 \\\n  --steps 12 --warmup 12 "
+             "--log_dir logs_check_%s" % (host, stamp))
+    train = ("python3 train_two_pipeline_clutter.py %s "
+             "--allow_pick 0 \\\n  --steps 150 --warmup 30 "
              "--log_dir logs_clutter_%s --save ckpt_clutter_%s.pt \\\n  "
              "--save_replay logs_clutter_%s/replay.npz --seed 0"
-             % (common, stamp, stamp, stamp))
-    other = flags.split(" --max_radial")[0]
+             % (host, stamp, stamp, stamp))
+    other = ("--table_z %.3f --ws_x_min %.2f --ws_x_max %.2f "
+             "--ws_y_min %.2f --ws_y_max %.2f --anchor \"%.2f,%.2f\""
+             % (cfg["TABLE_Z"], cfg["WS_X_MIN"], cfg["WS_X_MAX"],
+                cfg["WS_Y_MIN"], cfg["WS_Y_MAX"], cfg["TARGET_X"],
+                cfg["TARGET_Y"]))
     return check, train, other
+
+
+def stored_summary(cfg):
+    """The one parameter set, as stored on the server."""
+    rows = [("table height (TABLE_Z)", "%.3f m" % cfg["TABLE_Z"]),
+            ("work area x", "%.2f .. %.2f m" % (cfg["WS_X_MIN"],
+                                                cfg["WS_X_MAX"])),
+            ("work area y", "%.2f .. %.2f m" % (cfg["WS_Y_MIN"],
+                                                cfg["WS_Y_MAX"])),
+            ("anchor (where the red block goes)",
+             "%.2f, %.2f" % (cfg["TARGET_X"], cfg["TARGET_Y"])),
+            ("reach from the robot centre", "%.2f .. %.2f m"
+             % (cfg.get("MIN_RADIAL", 0.0), cfg["MAX_RADIAL"])),
+            ("gripper pitch", "%.2f rad" % cfg["GRASP_PITCH"]),
+            ("fingertip height correction (ARM_Z_OFFSET)",
+             "%.3f m" % cfg["ARM_Z_OFFSET"]),
+            ("grasp depth (GRASP_DZ)", "%.3f m" % cfg["GRASP_DZ"]),
+            ("push height (PUSH_EE_Z)", "%.3f m" % cfg["PUSH_EE_Z"]),
+            ("grasp circle (GRASP_CLEARANCE)",
+             "%.3f m" % cfg.get("GRASP_CLEARANCE", 0.06)),
+            ("largest target size (TARGET_MAX_EXTENT)",
+             "%.3f m" % cfg.get("TARGET_MAX_EXTENT", 0.085))]
+    width = max(len(r[0]) for r in rows)
+    return "\n".join("    %-*s  %s" % (width, a, b) for a, b in rows)
 
 
 # ---------------- the whole procedure ----------------
@@ -1435,6 +1504,9 @@ def run(args, robot):
         meta["background_at"] = datetime.datetime.now().strftime(
             "%Y-%m-%d %H:%M")
         wait_for_clear_table(robot, cfg, table, home_xyz)
+        if args.camera_only:
+            return camera_only_finish(args, robot, cfg, meta, table,
+                                      home_xyz, box, result, start_cfg)
 
         # ================= 2. FINGERTIPS =================
         header("2. FINGERTIPS  (where the arm really goes)")
@@ -1449,7 +1521,7 @@ def run(args, robot):
         centre = np.asarray(wide["anchor"], dtype=float)
         direction = centre / np.linalg.norm(centre)
         if (args.table_hint is not None and args.table_hint < 0.05
-                and args.pitches == "1.0"):
+                and args.pitches == "1.0,1.2,1.4"):
             # reaching down to floor level favours a more vertical
             # gripper; let the scan compare, unless pitches were given
             args.pitches = "1.0,1.3,1.5"
@@ -1702,9 +1774,11 @@ def run(args, robot):
         "mode": result["mode"],
         "status": "ok" if failure is None else "grasp_failed",
         "r_max": r_max, "r_lo": r_lo, "target_max_extent": max_extent,
+        "table_outline": table_outline(table),
         "test": "%d/%d" % (wins, len(tests))})
     if not args.quick:
         meta["full_done"] = failure is None
+    cfg = robot.set({"TARGET_MAX_EXTENT": max_extent})
     saved = robot.send({"cmd": "save_config", "meta": meta})
     robot.start_cfg = None           # stored on purpose; nothing to undo
     result.update({"config": cfg, "meta": meta, "failure": failure})
@@ -1768,16 +1842,16 @@ def run(args, robot):
     result["ok"] = True
     check, train, other = training_commands(args, cfg, max_extent)
     result["commands"] = {"check": check, "train": train, "flags": other}
-    say("\nREADY. The server already uses these values and has saved them "
-        "to %s. They are loaded at every server start and win over "
-        "server_env.sh." % saved.get("file"))
+    say("\nREADY. ONE parameter set, stored on the robot in %s:\n"
+        % saved.get("file"))
+    say(stored_summary(cfg))
+    say("\nThe server loads this file at every start (it wins over "
+        "server_env.sh), and the training script reads these numbers from "
+        "the server. Nothing has to be typed: the commands below carry no "
+        "heights or work-area numbers. To change them, run this program "
+        "again.")
     if blind_note:
         say("Reminder: " + blind_note)
-    if max_extent > 0.0851:
-        say("The red block is %.0f mm long, so the commands carry "
-            "--target_max_extent %.2f (without it the block is taken for "
-            "a pile and never becomes the target)."
-            % (block_dims[0] * 1000, max_extent))
     say("\nA) Set up the full scene (red block + obstacles, all %.0f-%.0f "
         "cm from the robot centre), then a short random run to watch that "
         "every motion is safe:\n" % (ws["band"][0] * 100,
@@ -1785,10 +1859,57 @@ def run(args, robot):
     say(check)
     say("\nB) Training:\n")
     say(train)
-    say("\nC) The same numbers for the other tools (grasp_once.py, "
+    say("\nC) Only for the older tools that still take flags (grasp_once.py, "
         "verify_perception.py, diag_grasp.py):\n")
     say("  " + other)
     say("")
+    return result
+
+
+def camera_only_finish(args, robot, cfg, meta, table, home_xyz, box,
+                       result, start_cfg):
+    """--camera_only: table height, background and work area are new; the
+    arm's own numbers (fingertip correction, pitch, reach, grasp depth)
+    stay as stored. The arm only goes home; nothing else moves."""
+    header("4. WORKSPACE  (camera only: the arm is not moved)")
+    # the reach STORED before this run. (cfg at this point holds the
+    # temporary wide box of step 1, 0.20..0.46 m, which the first version
+    # of this mode wrongly kept: pushes were then sent beyond the arm's
+    # real reach.)
+    r_lo = float(start_cfg.get("MIN_RADIAL", 0.24))
+    r_max = float(start_cfg["MAX_RADIAL"])
+    if r_lo < 0.22 or r_max > 0.40:
+        say("the stored reach %.2f..%.2f m looks wrong (saved by the first "
+            "--camera_only version); using 0.24..0.36 m" % (r_lo, r_max))
+        r_lo, r_max = 0.24, 0.36
+    ws = plan_workspace(table, r_lo, r_max, home_xyz[:2], box=box)
+    if ws["area_cm2"] < 300:
+        say("NOTE: only %d cm^2 of table is both reachable and in view. "
+            "That is tight for three blocks in a row; it is saved anyway. "
+            "Pushes toward the empty parts are shortened or refused by the "
+            "server (and charged), which the policy has to learn."
+            % ws["area_cm2"])
+    cfg = robot.set(workspace_values(ws))
+    report_workspace(ws)
+    meta.update({
+        "calibrated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "mode": "camera_only", "status": "ok",
+        "r_max": r_max, "r_lo": r_lo,
+        "table_outline": table_outline(table)})
+    saved = robot.send({"cmd": "save_config", "meta": meta})
+    robot.start_cfg = None
+    result.update({"ok": True, "config": cfg, "meta": meta,
+                   "workspace": ws})
+    say("\nSAVED (camera only) to %s:\n" % saved.get("file"))
+    say(stored_summary(cfg))
+    say("\nKept from before: fingertip correction (ARM_Z_OFFSET), pitch, "
+        "reach, grasp depth. Check the fingertip height once with a ruler:"
+        "\n    python3 set_params.py --host %s --hover 0.05" % args.host)
+    check, train, _ = training_commands(args, cfg, 0.0)
+    say("\nShort safety run:\n")
+    say(check)
+    say("\nTraining:\n")
+    say(train)
     return result
 
 
@@ -1834,11 +1955,9 @@ def main(argv=None):
                         help="inner opening of the fully open jaw, METRES, "
                              "measured with a ruler (asked for once if not "
                              "given)")
-    parser.add_argument("--pitches", default="1.0",
+    parser.add_argument("--pitches", default="1.0,1.2,1.4",
                         help="gripper pitches to scan (1.57 = straight "
-                             "down). Default: only the pitch in use; add "
-                             "1.2,1.4 to compare, at the price of more "
-                             "extended holds for the elbow motor")
+                             "down)")
     parser.add_argument("--table_hint", type=float, default=None,
                         help="table top height above the FLOOR in metres, "
                              "from a tape measure. Needed for a very low "
@@ -1865,6 +1984,12 @@ def main(argv=None):
                              "choice")
     parser.add_argument("--trials", type=int, default=None,
                         help="test grasps (default 5, or 2 with --quick)")
+    parser.add_argument("--camera_only", action="store_true",
+                        help="after moving the table or the camera: measure "
+                             "table height, background and work area only. "
+                             "The arm does not move except to go home; its "
+                             "stored numbers (fingertip correction, reach, "
+                             "pitch, grasp depth) are kept")
     parser.add_argument("--hover", type=float, default=0.05,
                         help="fingertip height above the table while "
                              "photographing the closed jaw (m)")

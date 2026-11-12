@@ -206,7 +206,9 @@ TARGET_X = float(os.environ.get("TARGET_X", "0.40"))
 TARGET_Y = float(os.environ.get("TARGET_Y", "0.03"))
 TARGET_TOP_Z = float(os.environ.get("TARGET_TOP_Z", "0.31"))
 TARGET_TRACK_MAX = 0.10
-TARGET_MAX_XY_EXTENT = 0.075  # larger usually means target+obstacle merged
+# Largest xy size the target may have and still count as one block. Part of
+# the stored calibration (TARGET_MAX_EXTENT), so the 9 cm bar is set once.
+TARGET_MAX_XY_EXTENT = float(os.environ.get("TARGET_MAX_EXTENT", "0.085"))
 MAX_OBSTACLES = 4
 # Radius of the "no obstacle point allowed" circle drawn at the target's
 # xy centroid. 0.06 m = target half-width (~0.015) + gripper half-opening
@@ -318,6 +320,16 @@ PUSH_FROM_FACE = env_flag("PUSH_FROM_FACE", True)
 PUSH_STEP = float(os.environ.get("PUSH_STEP", "0.004"))
 PUSH_STEP_PAUSE = float(os.environ.get("PUSH_STEP_PAUSE", "0.10"))
 PUSH_STALL_STEPS = int(os.environ.get("PUSH_STALL_STEPS", "3"))
+# Oct 29g: the jaw is closed once, before the first push, and then STAYS
+# closed: no open between pushes, at home or at an episode reset. On Oct
+# 29 the gripper motor (ID 7) tripped "Overload error" three times, each
+# time 4.4 s after an OPEN command, the last time with the arm already at
+# home and nothing near the fingers. Closing never tripped it, and a
+# closed jaw rests at zero power (/gripper/state = 3). So during push-only
+# training (--allow_pick 0) the jaw is simply never opened. A grasp
+# primitive still opens it as before. JAW_STAYS_CLOSED=0 brings back the
+# 29f behaviour (open at home after every push).
+JAW_STAYS_CLOSED = env_flag("JAW_STAYS_CLOSED", True)
 # Half thickness of the closed jaw plus a margin: the fingers are not put
 # down closer than this to any OTHER object.
 PUSH_FINGER_CLEARANCE = float(os.environ.get("PUSH_FINGER_CLEARANCE", "0.012"))
@@ -326,6 +338,27 @@ PUSH_FINGER_CLEARANCE = float(os.environ.get("PUSH_FINGER_CLEARANCE", "0.012"))
 # raised table silently turned that into a 4 mm gap and the push scraped
 # the surface.
 PUSH_TARGET_MARGIN = 0.025
+# Refuse a push that would drive an obstacle into the target. OFF by
+# default (Oct 28): pushing an obstacle into the red block is a bad move
+# for the TASK, not a danger to the robot, so it is left to the reward
+# (the client charges "hit_target" and the lost clearance) and the policy
+# learns it. The refusals that remain are the ones that protect the robot:
+# out of reach, fingers landing on another object, object pushed off the
+# table edge or into the inner limit. PROTECT_TARGET=1 brings it back.
+PROTECT_TARGET = env_flag("PROTECT_TARGET", False)
+# Table contact during a push: the fingertips (from the arm's own encoders)
+# are this much higher than commanded -> the table is holding them up.
+# The stroke stops and the arm lifts. Oct 28: a stroke at 1 cm scraped the
+# table from one side to the other and an overloaded motor shut the robot
+# down.
+PUSH_CONTACT_TOL = float(os.environ.get("PUSH_CONTACT_TOL", "0.008"))
+# The stroke stops when the fingertips (arm's encoders) come closer than
+# this to the table top.
+PUSH_TABLE_GAP = float(os.environ.get("PUSH_TABLE_GAP", "0.004"))
+# A push may START this far beyond MAX_RADIAL (the IK decides the rest).
+PUSH_START_SLACK = float(os.environ.get("PUSH_START_SLACK", "0.03"))
+# Largest upward correction the stroke may add to hold its height.
+PUSH_MAX_LIFT = float(os.environ.get("PUSH_MAX_LIFT", "0.03"))
 
 # ---------------- point cloud (base frame, metres) ----------------
 # Manual camera is the default. The server then never commands pan/tilt; use
@@ -350,7 +383,7 @@ TABLE_Z = float(os.environ.get("TABLE_Z", "0.225"))
 # the way in in _ee_pos, so nothing else in the code has to know two frames
 # exist. Calibrate it with z_calibrate.py (hover at a commanded height,
 # measure the fingertip-to-table gap with a ruler, solve).
-SERVER_BUILD = "2026-10-14b"
+SERVER_BUILD = "2026-10-29g"
 ARM_Z_OFFSET = float(os.environ.get("ARM_Z_OFFSET", "0.0"))
 # The same reconciliation, extended. calibrate_all.py photographs the
 # fingertips against a block at several places on the table and fits the
@@ -439,6 +472,15 @@ HOLD_SECONDS = float(os.environ.get("HOLD_SECONDS", "2.0"))
 # whose END is beyond it is shortened to end at the limit instead of being
 # refused outright, so "push a bit further" still moves the object.
 MAX_RADIAL = float(os.environ.get("MAX_RADIAL", "0.38"))
+# Inner reach limit: nothing is pushed closer to the robot than this, and the
+# target is not grasped closer than this. Objects at the near table edge are
+# where the arm hit the table on its way home (Oct 2026). Measured by
+# calibrate_all.py (closest usable distance) and stored with the rest.
+MIN_RADIAL = float(os.environ.get("MIN_RADIAL", "0.22"))
+# Before every move to home the fingertips first go straight up to this
+# height above the table, so the joint-space move home starts clear of the
+# table edge.
+RETRACT_DZ = float(os.environ.get("RETRACT_DZ", "0.10"))
 # Jaw opening of the gripper when fully open. Used to reason about a
 # TILTED grasp: with the gripper pitched away from vertical, the two
 # fingertips are not at the same height. If the jaw closes in the tilt
@@ -475,6 +517,7 @@ CALIB_FILE = os.path.expanduser(
     os.environ.get("CALIB_FILE", "~/locobot_calibration.json"))
 USE_CALIB_FILE = env_flag("USE_CALIB_FILE", True)
 CALIB_META = {}
+CALIB_SAVED_AT = None
 
 # name -> (lowest, highest) accepted value. A value outside its range is
 # refused, so a wrong measurement cannot send the arm somewhere absurd.
@@ -497,7 +540,9 @@ CONFIG_LIMITS = {
     "PREGRASP_DZ": (0.015, 0.12), "GRASP_DZ": (-0.05, 0.0),
     "LIFT_DZ": (0.02, 0.15),
     "PUSH_EE_Z": (-0.20, 0.70), "PUSH_APPROACH_DZ": (0.02, 0.12),
-    "MAX_RADIAL": (0.20, 0.50),
+    "MAX_RADIAL": (0.20, 0.50), "MIN_RADIAL": (0.10, 0.40),
+    "RETRACT_DZ": (0.04, 0.20),
+    "GRASP_CLEARANCE": (0.02, 0.15), "TARGET_MAX_EXTENT": (0.03, 0.20),
     "GRIPPER_OPENING": (0.02, 0.12),
     "FINGER_TABLE_MARGIN": (0.002, 0.03),
     "HOLD_SECONDS": (0.0, 10.0),
@@ -527,7 +572,10 @@ def current_config():
         "GRASP_PITCH": GRASP_PITCH,
         "PREGRASP_DZ": PREGRASP_DZ, "GRASP_DZ": GRASP_DZ, "LIFT_DZ": LIFT_DZ,
         "PUSH_EE_Z": PUSH_EE_Z, "PUSH_APPROACH_DZ": PUSH_APPROACH_DZ,
-        "MAX_RADIAL": MAX_RADIAL,
+        "MAX_RADIAL": MAX_RADIAL, "MIN_RADIAL": MIN_RADIAL,
+        "RETRACT_DZ": RETRACT_DZ,
+        "GRASP_CLEARANCE": GRASP_CLEARANCE,
+        "TARGET_MAX_EXTENT": TARGET_MAX_XY_EXTENT,
         "GRIPPER_OPENING": GRIPPER_OPENING,
         "FINGER_TABLE_MARGIN": FINGER_TABLE_MARGIN,
         "HOLD_SECONDS": HOLD_SECONDS,
@@ -543,6 +591,7 @@ def apply_config(values, quiet=False):
     global ARM_DX, ARM_DY, ARM_DR, ARM_DT, GRASP_XY_OFFSET, GRASP_PITCH
     global PREGRASP_DZ, GRASP_DZ, LIFT_DZ, PUSH_EE_Z, PUSH_APPROACH_DZ
     global MAX_RADIAL, GRIPPER_OPENING, FINGER_TABLE_MARGIN, HOLD_SECONDS
+    global MIN_RADIAL, RETRACT_DZ, GRASP_CLEARANCE, TARGET_MAX_XY_EXTENT
     before = current_config()
     after = dict(before)
     for name, value in values.items():
@@ -562,6 +611,8 @@ def apply_config(values, quiet=False):
     if not (after["WS_X_MIN"] + 0.05 <= after["WS_X_MAX"]
             and after["WS_Y_MIN"] + 0.05 <= after["WS_Y_MAX"]):
         raise ValueError("workspace box is empty or thinner than 5 cm")
+    if after["MIN_RADIAL"] + 0.05 > after["MAX_RADIAL"]:
+        raise ValueError("MIN_RADIAL must be at least 5 cm below MAX_RADIAL")
     if after["HARD_Z_MIN"] < after["TABLE_Z"] - 0.01:
         raise ValueError("HARD_Z_MIN may not be more than 1 cm below TABLE_Z")
     TABLE_Z = after["TABLE_Z"]
@@ -584,6 +635,9 @@ def apply_config(values, quiet=False):
     PUSH_EE_Z = after["PUSH_EE_Z"]
     PUSH_APPROACH_DZ = after["PUSH_APPROACH_DZ"]
     MAX_RADIAL = after["MAX_RADIAL"]
+    MIN_RADIAL, RETRACT_DZ = after["MIN_RADIAL"], after["RETRACT_DZ"]
+    GRASP_CLEARANCE = after["GRASP_CLEARANCE"]
+    TARGET_MAX_XY_EXTENT = after["TARGET_MAX_EXTENT"]
     GRIPPER_OPENING = after["GRIPPER_OPENING"]
     FINGER_TABLE_MARGIN = after["FINGER_TABLE_MARGIN"]
     HOLD_SECONDS = after["HOLD_SECONDS"]
@@ -599,12 +653,13 @@ def apply_config(values, quiet=False):
 
 def save_calibration_file(meta=None):
     """Write the current values (and the calibration notes) to CALIB_FILE."""
-    global CALIB_META
+    global CALIB_META, CALIB_SAVED_AT
     if meta is not None:
         CALIB_META = dict(meta)
+    CALIB_SAVED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
     payload = {"config": current_config(), "meta": CALIB_META,
                "server_build": SERVER_BUILD,
-               "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+               "saved_at": CALIB_SAVED_AT}
     temp = CALIB_FILE + ".tmp"
     with open(temp, "w") as handle:
         json.dump(payload, handle, indent=1, sort_keys=True)
@@ -616,7 +671,7 @@ def save_calibration_file(meta=None):
 
 def load_calibration_file():
     """Apply CALIB_FILE on top of the environment values, if it exists."""
-    global CALIB_META
+    global CALIB_META, CALIB_SAVED_AT
     if not USE_CALIB_FILE:
         print("[calib] USE_CALIB_FILE=0: the calibration file is ignored")
         return False
@@ -633,6 +688,7 @@ def load_calibration_file():
               % (CALIB_FILE, payload.get("saved_at", "?")))
         apply_config(known)
         CALIB_META = dict(payload.get("meta") or {})
+        CALIB_SAVED_AT = payload.get("saved_at")
         return True
     except Exception as error:
         print("[calib] WARNING: could not use %s (%s). Falling back to the "
@@ -952,8 +1008,45 @@ class GraspEnv(object):
               % np.round(self.home_joints, 6).tolist())
         return self.home_joints.copy()
 
+    def _retract(self):
+        """Lift the fingertips straight up before going home.
+
+        The move home is a joint-space move: every joint turns at once
+        toward its home angle. Started from a low pose near the robot (an
+        object at the near table edge), that sweep took the gripper or the
+        forearm through the table edge and the arm's overload protection
+        shut it down. Going straight up first starts the sweep clear of the
+        table. If the arm is already high, or nowhere near the table, this
+        does nothing."""
+        try:
+            tip = self._fingertip_from_wrist(self.last_pitch)
+        except Exception:
+            return
+        if not np.all(np.isfinite(tip)):
+            return
+        safe_z = TABLE_Z + RETRACT_DZ
+        if tip[2] >= safe_z - 0.01 or self._at_home():
+            return
+        radial = float(np.hypot(tip[0], tip[1]))
+        # straight up first; if the IK refuses that close to the robot, go
+        # up a little less, then up and slightly outward
+        tries = [(tip[0], tip[1], safe_z),
+                 (tip[0], tip[1], max(tip[2] + 0.04, TABLE_Z + 0.05))]
+        if radial > 1e-3:
+            out = (radial + 0.03) / radial
+            tries.append((tip[0] * out, tip[1] * out, safe_z))
+        for xyz in tries:
+            if self._goto_xyz(list(xyz), pitch=self.last_pitch,
+                              correct=False, quiet=True, any_xy=True):
+                return
+        self._log_motion(
+            "retract: could not lift the gripper at %s before going home; "
+            "going home directly" % np.round(tip, 3).tolist())
+
     def go_episode_home(self):
-        """Move to the configured/captured home; never recapture implicitly."""
+        """Move to the configured/captured home; never recapture implicitly.
+        The gripper is lifted clear of the table first (see _retract)."""
+        self._retract()
         if self.home_joints is None:
             result = self.arm.go_home()
         else:
@@ -961,7 +1054,14 @@ class GraspEnv(object):
                 self.home_joints.tolist(), plan=ARM_HOME_PLAN)
         time.sleep(SETTLE_TIME)
         # Some PyRobot versions return None after a successful command.
-        return True if result is None else bool(result)
+        ok = True if result is None else bool(result)
+        # Oct 29f: the jaw left closed by a push is opened HERE, at home,
+        # where the fingers are clear of the table and the blocks. Not
+        # when holding a grasped object.
+        if (ok and not JAW_STAYS_CLOSED and not self.holding
+                and self.gripper_flag >= 0.5):
+            self._open_gripper()
+        return ok
 
     # ---------- camera pan/tilt ----------
 
@@ -1517,7 +1617,7 @@ class GraspEnv(object):
         return tip
 
     def _goto_xyz(self, xyz, wait=True, pitch=None, roll=None,
-                  settle=None, correct=True, quiet=False):
+                  settle=None, correct=True, quiet=False, any_xy=False):
         """Move the FINGERTIPS to xyz. Returns True on success.
         pitch/roll override GRASP_PITCH/GRASP_ROLL for this one call.
         settle overrides SETTLE_TIME; correct=False skips the residual
@@ -1528,8 +1628,9 @@ class GraspEnv(object):
         roll = GRASP_ROLL if roll is None else float(roll)
         settle = SETTLE_TIME if settle is None else float(settle)
         self.last_pitch = pitch
-        if (xyz[2] < HARD_Z_MIN or xyz[0] < WS_X[0] or xyz[0] > WS_X[1]
-                or xyz[1] < WS_Y[0] or xyz[1] > WS_Y[1]):
+        outside = (xyz[0] < WS_X[0] or xyz[0] > WS_X[1]
+                   or xyz[1] < WS_Y[0] or xyz[1] > WS_Y[1])
+        if xyz[2] < HARD_Z_MIN or (outside and not any_xy):
             self._log_motion(
                 "out-of-workspace xyz=%s (WS_X=%s WS_Y=%s HARD_Z_MIN=%.3f)"
                 % (np.round(xyz, 3).tolist(), list(WS_X), list(WS_Y),
@@ -1789,10 +1890,55 @@ class GraspEnv(object):
         fraction = np.clip(np.dot(point - start, segment) / denom, 0.0, 1.0)
         return float(np.linalg.norm(point - (start + fraction * segment)))
 
+    @staticmethod
+    def _inside_table(xy):
+        """Distance (m) from xy to the nearest edge of the stored table
+        outline, positive inside. None when no outline is stored."""
+        poly = CALIB_META.get("table_outline") if CALIB_META else None
+        if not poly or len(poly) < 3:
+            return None
+        poly = np.asarray(poly, dtype=float)
+        best = None
+        for i in range(len(poly)):
+            a, b = poly[i], poly[(i + 1) % len(poly)]
+            edge = b - a
+            length = float(np.linalg.norm(edge))
+            if length < 1e-9:
+                continue
+            # counter-clockwise outline: inside is to the left of each edge
+            d = float(edge[0] * (xy[1] - a[1]) - edge[1] * (xy[0] - a[0])) \
+                / length
+            best = d if best is None else min(best, d)
+        return best
+
+    def _room_on_table(self, c, direction, keep, allowed):
+        """How far (<= allowed) the object's centre may move along
+        direction and stay `keep` inside the table outline. An object that
+        already lies closer to the edge than `keep` may still move, but not
+        closer to the edge than it is now."""
+        start = self._inside_table(c)
+        if start is None:
+            return allowed
+        floor = min(keep, start) - 1e-4
+        t, ok = 0.0, 0.0
+        while t <= allowed + 1e-9:
+            d = self._inside_table(c + direction * t)
+            if d is None or d < floor:
+                break
+            ok = t
+            t += 0.005
+        return min(ok, allowed) if t <= allowed + 1e-9 else allowed
+
     def scripted_push(self, obstacle, direction, distance, is_target=False):
         """Push one selected object in XY. Returns (completed, blocked).
         is_target: the object being pushed IS the target, so the rule that
         refuses a push whose path crosses the target does not apply."""
+        # Reset first, so a push that is refused before it starts reports
+        # steps=0 and a "refused" reason instead of the previous push's
+        # numbers. The client charges a refused action (the arm did not
+        # move) more than a plain step; see DEFAULT_W["refused"].
+        self.last_push = {"steps": 0, "stopped": "", "advance": 0.0,
+                          "refused": ""}
         direction = np.asarray(direction, dtype=float)
         norm = float(np.linalg.norm(direction))
         if norm < 0.15:
@@ -1809,21 +1955,37 @@ class GraspEnv(object):
             abs(direction[0]) * obstacle["extent"][0]
             + abs(direction[1]) * obstacle["extent"][1])
         object_end = center + direction * distance
-        if not is_target and self.target_visible:
+        if PROTECT_TARGET and not is_target and self.target_visible:
             target_radius = 0.5 * float(np.linalg.norm(
                 self.target_extent[:2])) + PUSH_TARGET_MARGIN
-            if self._point_segment_distance(
-                    self.target_centroid[:2], center,
-                    object_end) < target_radius:
+            # Refuse only a push that brings the object CLOSER to the
+            # target. An obstacle that already touches the target is
+            # inside this radius at its start, and the old test (any point
+            # of the path within the radius) refused every push of it,
+            # including the sideways push that frees the target.
+            closest = self._point_segment_distance(
+                self.target_centroid[:2], center, object_end)
+            start_gap = float(np.linalg.norm(
+                np.asarray(center, dtype=float) - self.target_centroid[:2]))
+            # 1 cm of slack: a push meant to go sideways is never exactly
+            # perpendicular, and a touching neighbour then comes a few mm
+            # closer at the start of the stroke.
+            if closest < target_radius and closest < start_gap - 0.010:
                 print("[push] blocked: predicted path crosses target")
+                self.last_push["refused"] = "path crosses the target"
                 return False, True
 
         start_xy = center - direction * (half_width + PUSH_TOOL_OFFSET)
-        if float(np.linalg.norm(start_xy)) > MAX_RADIAL:
+        # The reach scan measured 0.42 m at pitch 1.0. The start point may
+        # lie PUSH_START_SLACK beyond MAX_RADIAL; whether the arm really
+        # gets there is then the IK's decision (a refusal costs no motion).
+        if float(np.linalg.norm(start_xy)) > MAX_RADIAL + PUSH_START_SLACK:
             self._log_motion(
-                "push start %s is at radial %.2f, beyond MAX_RADIAL %.2f"
+                "push start %s is at radial %.2f, beyond %.2f"
                 % (np.round(start_xy, 3).tolist(),
-                   float(np.linalg.norm(start_xy)), MAX_RADIAL))
+                   float(np.linalg.norm(start_xy)),
+                   MAX_RADIAL + PUSH_START_SLACK))
+            self.last_push["refused"] = "start beyond reach"
             return False, True
         # Where the fingertips stop. The closed jaw meets the object at its
         # NEAR face (centre - half_width) and should carry that face forward
@@ -1849,18 +2011,75 @@ class GraspEnv(object):
             end_xy = c + direction * t
             print("[push] end shortened to radial %.2f (was %.2f)"
                   % (float(np.linalg.norm(end_xy)), end_radial))
-        margin = 0.015
-        start_xy[0] = np.clip(start_xy[0], WS_X[0] + margin, WS_X[1] - margin)
-        start_xy[1] = np.clip(start_xy[1], WS_Y[0] + margin, WS_Y[1] - margin)
-        end_xy[0] = np.clip(end_xy[0], WS_X[0] + margin, WS_X[1] - margin)
-        end_xy[1] = np.clip(end_xy[1], WS_Y[0] + margin, WS_Y[1] - margin)
+        # Keep the pushed object on the usable table. Two limits:
+        #  * the inner reach limit MIN_RADIAL (+2 cm, a pushed block slides
+        #    on a little): near the robot the arm hit the table going home;
+        #  * the edges of the work area (the table as calibrate_all.py saw
+        #    it) minus half the object and 2 cm. The table's front edge is a
+        #    straight line, so at the sides of the table it is farther than
+        #    MIN_RADIAL and the radial limit alone does not protect it.
+        # The object's centre moves by about `distance`. If it would end
+        # outside, the stroke is shortened; refused if almost nothing is
+        # left.
+        c = np.asarray(center, dtype=float)
+        half = 0.5 * float(np.linalg.norm(obstacle["extent"][:2]))
+        allowed, why = distance, ""
+        # Oct 29: the only limit on where a pushed object may END is that
+        # it stays ON THE TABLE (the outline calibrate_all.py stored):
+        # its centre at least half its size + 1 cm inside the edge. The
+        # inner-radius and work-area-box limits are gone; where a block
+        # ends up is the reward's business (near_edge, outreach, ...).
+        keep = half + 0.01
+        if self._inside_table(c) is None:
+            # no outline stored (older calibration): fall back to the box
+            for axis, (lo, hi) in ((0, WS_X), (1, WS_Y)):
+                d = float(direction[axis])
+                if d < -1e-6:
+                    t = max(0.0, (c[axis] - lo - keep) / -d)
+                elif d > 1e-6:
+                    t = max(0.0, (hi - keep - c[axis]) / d)
+                else:
+                    continue
+                if t < allowed:
+                    allowed, why = t, "off the edge of the work area"
+        else:
+            on_table = self._room_on_table(c, direction, keep, allowed)
+            if on_table < allowed:
+                allowed, why = on_table, "off the edge of the table"
+        if allowed < distance:
+            if allowed < 0.5 * PUSH_MIN_DISTANCE:
+                self._log_motion(
+                    "push refused: it would move the object at %s %s"
+                    % (np.round(c, 3).tolist(), why))
+                self.last_push["refused"] = "toward the table edge"
+                return False, True
+            shorten = distance - allowed
+            end_xy = end_xy - direction * shorten
+            print("[push] shortened by %.0f mm: the object would end %s"
+                  % (shorten * 1000, why))
+        if self._inside_table(c) is None:
+            # Only without a table outline: keep the fingers in the box.
+            # (Clipping the START into the box moves it toward the object
+            # and can put the fingers down on the object itself, so with an
+            # outline the points are left as computed.)
+            margin = 0.015
+            start_xy[0] = np.clip(start_xy[0], WS_X[0] + margin,
+                                  WS_X[1] - margin)
+            start_xy[1] = np.clip(start_xy[1], WS_Y[0] + margin,
+                                  WS_Y[1] - margin)
+            end_xy[0] = np.clip(end_xy[0], WS_X[0] + margin, WS_X[1] - margin)
+            end_xy[1] = np.clip(end_xy[1], WS_Y[0] + margin, WS_Y[1] - margin)
 
-        self.last_push = {"steps": 0, "stopped": "", "advance": 0.0}
         # The fingers come straight down at start_xy. If another object
         # lies there, the arm would press down on it with all it has; that
         # is the hardest "push" this robot can give and it is never wanted.
         # Refuse instead: the policy has to come at the object from a side
         # where there is room for the fingers.
+        # (Build 29e pushed with the jaw open and checked both open
+        # fingertips here; 29f is back to a closed jaw, one contact point.)
+        start_xy = np.asarray(start_xy, dtype=float)
+        finger_drop = 0.0
+        push_z = PUSH_EE_Z
         occupied = self._object_at(start_xy, center)
         if occupied is not None:
             self._log_motion(
@@ -1869,19 +2088,35 @@ class GraspEnv(object):
                 % (np.round(start_xy, 3).tolist(),
                    np.round(occupied, 3).tolist()))
             self.last_push["stopped"] = "no room for the fingers"
+            self.last_push["refused"] = "no room for the fingers"
             return False, True
 
-        # Fingers CLOSED before the arm comes down: one well-defined
-        # contact point at the centre of the closed jaw, and no chance of
-        # a finger slipping past the side of the block.
-        self._close_gripper()
-        up = PUSH_EE_Z + PUSH_APPROACH_DZ
-        start_xy = np.asarray(start_xy, dtype=float)
+        # Fingers CLOSED before the arm comes down (the arm is still at
+        # home here): one contact point, no finger slipping past the block.
+        #
+        # Oct 29f, why the gripper motor (ID 7) tripped "Overload error":
+        # locobot_controller closes the jaw in PWM mode and sets the power
+        # to 0 once the fingers are shut (/gripper/state = 3, checked on
+        # the robot on Oct 29), so a closed jaw does NOT load the motor.
+        # Opening is different: it is a position move held at full
+        # strength, and if a finger meets a block or the table on its way
+        # open, the motor pushes against it until it trips (the error came
+        # 4 s after "Gripper open"). Until 29e the jaw was opened right
+        # after the stroke, also when the arm had NOT got back up (the lift
+        # at the far end of the reach is often refused by the IK), i.e.
+        # with the fingers still down next to the pushed block.
+        # So from 29f the jaw is opened only at home (go_episode_home).
+        # 29g: that open at home tripped the motor too, so with
+        # JAW_STAYS_CLOSED (default) the jaw is closed once and left
+        # closed; a jaw that is already closed gets no new command.
+        if self.gripper_flag < 0.5:
+            self._close_gripper()
+        up = push_z + PUSH_APPROACH_DZ
         sweep = np.asarray(end_xy, dtype=float) - start_xy
         length = float(np.linalg.norm(sweep))
         along = sweep / length if length > 1e-6 else direction
 
-        def at(travel, z=PUSH_EE_Z):
+        def at(travel, z=push_z):
             xy = start_xy + along * travel
             return [float(xy[0]), float(xy[1]), z]
 
@@ -1889,25 +2124,74 @@ class GraspEnv(object):
             return float(np.dot(
                 self._fingertip_from_wrist(self.last_pitch)[:2], along))
 
-        ok1 = self._goto_xyz(at(0.0, up))
-        ok2 = self._goto_xyz(at(0.0)) if ok1 else False
+        def tip_z():
+            return float(self._fingertip_from_wrist(self.last_pitch)[2])
+
+        # Height hold. A plain move (goto, the hover check) re-commands
+        # once with the residual, so it ends where it was sent. The push
+        # stroke moves in 4 mm steps WITHOUT that re-command, and under
+        # load the arm settles LOWER than sent: on Oct 28-29 a stroke
+        # commanded 1-2 cm above the table ran on the table. So the
+        # stroke measures how much lower it is (from the arm's encoders)
+        # and raises the command by that much. Only ever UP: a correction
+        # downward could press into the table.
+        lift = [0.0]
+        heights = []
+
+        def hold_height():
+            low = push_z - tip_z()
+            # recorded: the LOWER fingertip above the table
+            heights.append(tip_z() - finger_drop - TABLE_Z)
+            if low > 0.002:
+                lift[0] = min(lift[0] + low, PUSH_MAX_LIFT)
+
+        def touching():
+            # fingertips within PUSH_TABLE_GAP of the table top, or held
+            # higher than commanded (pressed up by something)
+            z = tip_z()
+            return (z - finger_drop < TABLE_Z + PUSH_TABLE_GAP
+                    or z > push_z + lift[0] + PUSH_CONTACT_TOL)
+
+        def at_h(travel, z=None):
+            return at(travel, push_z + lift[0] if z is None else z)
+
+        ok1 = self._goto_xyz(at(0.0, up), any_xy=True)
+        # Descend WITHOUT the residual re-command (it could drive the
+        # fingers into the table), then raise by however much it sagged.
+        ok2 = (self._goto_xyz(at_h(0.0), correct=False, any_xy=True)
+               if ok1 else False)
         travel, stopped, steps = 0.0, "", 0
         if ok2:
+            hold_height()
+            if lift[0] > 0.0:
+                ok2 = self._goto_xyz(at_h(0.0), correct=False, quiet=True,
+                                     any_xy=True)
+                hold_height()
+        if ok2 and touching():
+            stopped = ("the fingertips are at the table on the way down "
+                       "(%.0f mm above it, %.0f mm wanted): no stroke"
+                       % ((tip_z() - finger_drop - TABLE_Z) * 1000,
+                          (PUSH_EE_Z - TABLE_Z) * 1000))
+            self.last_push["table_contact"] = True
+        if ok2 and not stopped:
             # free travel: up to 1 cm before the face, in one move
             free = min(max(0.0, PUSH_TOOL_OFFSET - 0.010), length)
             if free > PUSH_STEP:
-                if self._goto_xyz(at(free), settle=PUSH_STEP_PAUSE,
-                                  correct=False, quiet=True):
+                if self._goto_xyz(at_h(free), settle=PUSH_STEP_PAUSE,
+                                  correct=False, quiet=True, any_xy=True):
                     travel = free
+                    hold_height()
                 else:
                     stopped = "the arm could not start the stroke"
-            # contact: small steps, a stop after each, never a re-command
+            # contact: small steps, a stop after each
             last, slow = tip_along(), 0
             step = max(PUSH_STEP, 0.001)
             while not stopped and travel < length - 1e-6:
                 target = min(length, travel + step)
-                reached = self._goto_xyz(at(target), settle=PUSH_STEP_PAUSE,
-                                         correct=False, quiet=True)
+                reached = self._goto_xyz(at_h(target),
+                                         settle=PUSH_STEP_PAUSE,
+                                         correct=False, quiet=True,
+                                         any_xy=True)
                 now = tip_along()
                 moved, last = now - last, now
                 steps += 1
@@ -1916,6 +2200,14 @@ class GraspEnv(object):
                                "(reach limit or something in the way)")
                     break
                 travel = target
+                if touching():
+                    stopped = ("the fingertips touch the table (%.0f mm "
+                               "above it, %.0f mm wanted): stroke stopped"
+                               % ((tip_z() - finger_drop - TABLE_Z) * 1000,
+                                  (PUSH_EE_Z - TABLE_Z) * 1000))
+                    self.last_push["table_contact"] = True
+                    break
+                hold_height()
                 slow = slow + 1 if moved < 0.25 * step else 0
                 if PUSH_STALL_STEPS > 0 and slow >= PUSH_STALL_STEPS:
                     stopped = ("the fingertips stopped advancing for %d "
@@ -1926,13 +2218,29 @@ class GraspEnv(object):
                     "push ended early after %.0f of %.0f mm: %s"
                     % (travel * 1000, length * 1000, stopped))
             # always back up and out, also after an early end
-            ok4 = self._goto_xyz(at(travel, up))
+            ok4 = self._goto_xyz(at(travel, up), any_xy=True)
         else:
             ok4 = False
+        if heights:
+            print("[push] fingertip height above the table during the "
+                  "stroke: %.0f..%.0f mm (wanted %.0f mm, command raised "
+                  "by %.0f mm to hold it)"
+                  % (min(heights) * 1000, max(heights) * 1000,
+                     (PUSH_EE_Z - TABLE_Z) * 1000, lift[0] * 1000))
         completed = bool(ok1 and ok2 and not stopped and ok4)
+        # The jaw stays CLOSED here (no force on the motor, see above). It
+        # is opened when the arm is back at home, where nothing is near
+        # the fingers (go_episode_home).
+        contact = bool(self.last_push.get("table_contact", False))
         self.last_push = {"steps": steps, "stopped": stopped,
+                          "table_contact": contact,
                           "advance": float(max(
-                              0.0, travel - PUSH_TOOL_OFFSET))}
+                              0.0, travel - PUSH_TOOL_OFFSET)),
+                          # the arm never got to the start point: the IK or
+                          # the workspace check refused the approach
+                          "refused": ("" if ok2 else
+                                      "the arm refused the approach "
+                                      "(IK / workspace)")}
         print("[push] completed=%s direction=%s distance=%.3f (closed jaw, "
               "%d steps of %.0f mm%s)"
               % (completed, np.round(direction, 3).tolist(), distance, steps,
@@ -1970,9 +2278,10 @@ class GraspEnv(object):
         failed; releasing first also means a successful episode resets
         itself, no human needed to replace the block."""
         if not self.holding:
-            # A closed jaw after a push is not a held object; just open.
-            if self.gripper_flag >= 0.5:
-                self._open_gripper()
+            # A closed jaw after a push is not a held object. It is opened
+            # at home (go_episode_home), not here: here the fingers may
+            # still be down next to a block, and opening into a block is
+            # what overloads the gripper motor (Oct 29f).
             return
         release = np.array([RELEASE_X, RELEASE_Y, TABLE_Z + RELEASE_DZ])
         print("[reset] gripper is closed; releasing at %s"
@@ -2005,7 +2314,8 @@ class GraspEnv(object):
                     "failed to move to episode home twice; check the arm "
                     "for a collision or a jammed joint")
         time.sleep(1.0)
-        self._open_gripper()
+        if not JAW_STAYS_CLOSED:
+            self._open_gripper()
         self.target_centroid = np.array(
             [TARGET_X, TARGET_Y, TARGET_TOP_Z - 0.03])
         self.target_extent = np.zeros(3)
@@ -2091,7 +2401,12 @@ class GraspEnv(object):
                              "push_stopped": self.last_push.get(
                                  "stopped", ""),
                              "push_advance": self.last_push.get(
-                                 "advance", 0.0)})
+                                 "advance", 0.0),
+                             # non-empty: nothing was pushed, and why
+                             "push_refused": self.last_push.get(
+                                 "refused", ""),
+                             "table_contact": bool(self.last_push.get(
+                                 "table_contact", False))})
             if not external:
                 self.update_perception(reset_target=False)
         else:
@@ -2168,7 +2483,8 @@ def serve():
                                 "file": os.path.abspath(__file__)}
                     elif cmd == "get_config":
                         resp = {"ok": True, "config": current_config(),
-                                "meta": CALIB_META,
+                                "meta": dict(CALIB_META,
+                                             saved_at=CALIB_SAVED_AT),
                                 "calib_file": CALIB_FILE,
                                 "calib_loaded": bool(CALIB_LOADED),
                                 "ik_numerical": bool(IK_NUMERICAL),

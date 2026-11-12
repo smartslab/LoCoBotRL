@@ -202,6 +202,36 @@ DEFAULT_W = {
                         # is a terminal failure (target_lost / outreach)
     "outreach": 5.0,    # red pushed beyond the arm's reach; TERMINAL
     "target_lost": 15.0,  # red left the table; TERMINAL
+    "pose_edge": 20.0,  # per metre the RED block moved into the outer 3 cm
+                        # of the reach ring (toward a reach limit): a red
+                        # block that can only be grasped at the limit is a
+                        # worse state. Potential-based, so pushing it back
+                        # earns the same amount back.
+    "pose_angle": 1.0,  # the red bar turned so the jaw must close along the
+                        # line to the robot (tilted fingers at different
+                        # heights, the awkward grasp): 0 = across, 1 = along
+    "crowd": 50.0,      # per metre a pushed obstacle ended CLOSER to the red
+                        # block (beyond 5 mm of noise): squeezing the red
+                        # block is the opposite of the task. 2 cm closer =
+                        # -1.0, a full 6 cm push into it = -3.0. Added on
+                        # top of the lost clearance and "hit_target".
+    "hit_target": 10.0, # a push aimed at ANOTHER object moved the red block
+                        # by more than 1 cm (the obstacle was driven into
+                        # it). Once per step, on top of "disturb" and the
+                        # lost clearance. The server no longer refuses such
+                        # pushes; this is how the policy learns not to.
+    "near_edge": 2.0,   # an obstacle ended up inside the inner reach limit
+                        # (the near table edge), once per object
+    "refused": 5.0,     # the chosen push could not be executed at all
+                        # (start point beyond the arm's reach, IK refused
+                        # the approach, fingers would land on another
+                        # object, object would be pushed off the table edge
+                        # or into the inner limit): the arm did not move.
+                        # 100x the step cost, as large as pushing the red
+                        # block out of reach. Smaller than driving an
+                        # obstacle into the red block (hit_target 10 +
+                        # crowd), so "try nothing" is never the cheap way
+                        # out. --w_refused sets it.
 }
 # "expose" and "split" are DIFFERENCES between the picture after and the
 # picture before, with the same size in both directions. Burying the target
@@ -814,7 +844,10 @@ STEP_COLUMNS = [
     "graspable_after", "clearance_after", "rule_reason", "auto_grasp",
     "held", "gripper_raw", "target_on_table_after",
     "success", "reward", "r_shaping", "r_clearance", "r_expose", "r_split",
-    "r_disturb", "r_lost", "r_outreach", "done", "motion_errors",
+    "r_disturb", "r_lost", "r_outreach", "r_refused", "r_near_edge",
+    "r_pose", "r_hit_target", "r_crowd",
+    "done",
+    "motion_errors",
     # added 2026-10-09 (at the end, so older column positions still hold)
     "r_target_lost", "target_lost", "terminal", "grasp_attempts"]
 EPISODE_COLUMNS = [
@@ -859,6 +892,8 @@ class EpisodeRunner(object):
     def __init__(self, env, route2, verbose=True, dump_dir=None,
                  dump_every=1, grasp_trigger="auto", clearance_min=0.06,
                  max_radial=0.38, credit_clear_grasp=True, weights=None,
+                 min_radial=0.0, max_ep_steps=0, push_frame="world",
+                 reset_prompt=False, scene_text="", show_anchor=False,
                  pause=False, home_each_step=False, grasp_retries=0,
                  max_blind_episodes=3, one_action=False, allow_pick=True):
         # one_action: every step is exactly ONE physical primitive. A step
@@ -896,6 +931,24 @@ class EpisodeRunner(object):
         self.grasp_trigger = grasp_trigger
         self.clearance_min = float(clearance_min)
         self.max_radial = float(max_radial)
+        self.min_radial = float(min_radial)
+        # episode length cut by the client (0 = only the server's HORIZON)
+        self.max_ep_steps = int(max_ep_steps)
+        self.ep_t = 0
+        # "relative": a[2:4] is a push direction in the frame of the chosen
+        # object, x axis = straight away from the red block. (1, 0) is then
+        # "push it away from the red one" for EVERY obstacle wherever it
+        # lies, so what is learned once holds everywhere. "world": a[2:4]
+        # is the robot-frame direction (the old behaviour).
+        self.push_frame = push_frame
+        # 0 never, 1 only when the scene is used up, 2 every episode
+        self.reset_prompt = int(reset_prompt)
+        # every push of the last episode was refused: the scene cannot be
+        # worked on as it lies, ask for a new one
+        self.stuck = False
+        self.ep_refused = 0
+        self.show_anchor = bool(show_anchor)
+        self.scene_text = scene_text
         self.credit_clear_grasp = bool(credit_clear_grasp)
         self.w = dict(DEFAULT_W)
         if weights:
@@ -1013,14 +1066,120 @@ class EpisodeRunner(object):
         return True, after, obs, clean
 
     @staticmethod
+    def _chosen(action, pushables):
+        """The pushable the server will pick for selector a[1] (the same
+        rule as the server: index = floor((a1 + 1) / 2 * n))."""
+        n = len(pushables)
+        index = min(int(0.5 * (float(action[1]) + 1.0) * n), n - 1)
+        return max(index, 0)
+
+    def _world_direction(self, action, perception):
+        """a[2:4] given in the chosen object's frame -> robot frame.
+        x axis: from the red block to the object (straight away from red);
+        for the red block itself: away from its nearest obstacle."""
+        pushables = perception["pushables"]
+        chosen = pushables[self._chosen(action, pushables)]
+        target = perception.get("target")
+        here = np.asarray(chosen["centroid"][:2], dtype=float)
+        if chosen.get("is_target"):
+            others = [np.asarray(o["centroid"][:2], dtype=float)
+                      for o in perception.get("obstacles") or []]
+            if not others:
+                return np.asarray(action[2:4], dtype=float)
+            nearest = min(others, key=lambda o: float(np.linalg.norm(
+                o - here)))
+            away = here - nearest
+        elif target is not None:
+            away = here - np.asarray(target["centroid"][:2], dtype=float)
+        else:
+            return np.asarray(action[2:4], dtype=float)
+        norm = float(np.linalg.norm(away))
+        if norm < 1e-6:
+            return np.asarray(action[2:4], dtype=float)
+        u = away / norm
+        v = np.array([-u[1], u[0]])
+        return float(action[2]) * u + float(action[3]) * v
+
+    def scripted_action(self, noise=0.15, rng=np.random):
+        """The obvious move, for demonstration episodes. Returned in the
+        policy's own action format (relative frame: x = away from red).
+
+        Take the obstacle nearest to the red block. If there is a gap of
+        3.5 cm or more between them, push it straight away from red. If
+        they touch, "straight away" is impossible: the closed jaw has to
+        come down on the far side of the obstacle, between it and red,
+        and there is no room there (the server refuses). Then push it
+        SIDEWAYS, out of the row, to the side that keeps it nearer the
+        middle of the reach ring. A red block pressed between two others
+        is freed by two such sideways pushes."""
+        view = self.view or {}
+        pushables = self._pushables(view) if view else []
+        action = np.array([-1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+        target = view.get("target")
+        if target is None or not view.get("obstacles"):
+            return np.clip(action + rng.normal(0, 0.5, ACT_DIM), -1, 1
+                           ).astype(np.float32)
+        n = len(pushables)
+        index = 1 if PUSH_RED else 0  # nearest obstacle
+        action[1] = 2.0 * (index + 0.5) / n - 1.0
+        obstacle = pushables[index]
+        red = np.asarray(target["centroid"][:2], dtype=float)
+        here = np.asarray(obstacle["centroid"][:2], dtype=float)
+        pts = np.asarray(obstacle.get("points_xy") or [here], dtype=float)
+        red_half = 0.5 * float(min(target["extent"][0],
+                                   target["extent"][1]))
+        gap = float(np.min(np.linalg.norm(pts - red, axis=1))) - red_half
+        if gap < 0.035:
+            u = here - red
+            u = u / max(float(np.linalg.norm(u)), 1e-6)
+            v = np.array([-u[1], u[0]])
+            half = 0.5 * float(np.linalg.norm(obstacle["extent"][:2]))
+            best = max((1.0, -1.0), key=lambda sgn: self._room(
+                here, sgn * v, half))
+            action[2], action[3] = 0.0, best
+        relative = action.copy()
+        if self.push_frame != "relative":
+            perception = {"target": target,
+                          "obstacles": view.get("obstacles"),
+                          "pushables": pushables}
+            action[2:4] = self._world_direction(relative, perception)
+        jitter = rng.normal(0, noise, ACT_DIM)
+        jitter[1] = 0.0               # keep the chosen object
+        if gap < 0.035:
+            # sideways push: noise may tilt it AWAY from red, never toward
+            # it (toward red is what the server refuses)
+            jitter[2] = abs(jitter[2])
+        return np.clip(action + jitter, -1, 1).astype(np.float32)
+
+    def _room(self, xy, direction, half):
+        """How far an object at xy can travel along direction before it
+        leaves the work area (minus half its size and 2 cm) or the reach
+        ring. The same limits the server enforces on a push."""
+        room = 0.20
+        cfg = getattr(getattr(self.route2, "backend", None), "config", None)
+        if cfg is not None:
+            keep = half + 0.02
+            for axis, (lo, hi) in ((0, cfg.box_x), (1, cfg.box_y)):
+                d = float(direction[axis])
+                if d < -1e-6:
+                    room = min(room, max(0.0, (xy[axis] - lo - keep) / -d))
+                elif d > 1e-6:
+                    room = min(room, max(0.0, (hi - keep - xy[axis]) / d))
+        for t in np.arange(0.0, room + 1e-9, 0.005):
+            r = float(np.linalg.norm(xy + direction * t))
+            if r < self.min_radial + 0.02 or r > self.max_radial - 0.02:
+                return float(t)
+        return float(room)
+
+    @staticmethod
     def _pushables(view):
-        """Objects the push selector may choose: the target FIRST when it is
-        visible, then the obstacles. Pushing the target out of a pile is a
-        legal clearing move; the target is never in the pick-and-place list.
-        Putting it first keeps a[1] near -1 meaning "push the red block"
-        whenever it can be seen."""
+        """Objects the push selector may choose. Default (Oct 29): the
+        obstacles ONLY. The red block stays where it is and the task is to
+        clear the obstacles away from it so it can be grasped in place.
+        With --push_red 1 the red block comes first in the list (the old
+        behaviour) and may be pushed out of a pile."""
         pushables = []
-        if view.get("target") is not None:
+        if PUSH_RED and view.get("target") is not None:
             entry = dict(view["target"])
             entry["is_target"] = True
             pushables.append(entry)
@@ -1082,14 +1241,17 @@ class EpisodeRunner(object):
         if acted is not None and not acted_is_target:
             acted_obs_index = acted
             if primitive == "push" and tb is not None:
-                acted_obs_index = acted - 1        # pushables had the target first
+                acted_obs_index = acted - (1 if PUSH_RED else 0)
         disturbance = 0.0
         lost_objects = []
         if tb is not None and ta is not None and not acted_is_target:
-            disturbance += float(np.linalg.norm(
+            red_moved = float(np.linalg.norm(
                 np.asarray(ta["centroid"][:2]) - np.asarray(tb["centroid"][:2])))
+            disturbance += red_moved
+            if red_moved > 0.01:
+                terms["hit_target"] = -w["hit_target"]
         remaining_a = [np.asarray(o["centroid"][:2], dtype=float) for o in obs_a]
-        acted_object, allowed = None, 0.0
+        acted_object, allowed, acted_after = None, 0.0, None
         if acted_is_target and tb is not None:
             acted_object = tb
         elif acted_obs_index is not None and 0 <= acted_obs_index < len(obs_b):
@@ -1110,14 +1272,14 @@ class EpisodeRunner(object):
             if primitive == "clear" and info.get("drop_xy") is not None:
                 places.insert(0, (np.asarray(info["drop_xy"], dtype=float),
                                   0.10))
-            found = False
+            found, acted_after = False, None
             for place, limit in places:
                 if not remaining_a:
                     break
                 dist = [float(np.linalg.norm(a - place)) for a in remaining_a]
                 k = int(np.argmin(dist))
                 if dist[k] <= limit:
-                    remaining_a.pop(k)  # its own destination is not collateral
+                    acted_after = remaining_a.pop(k)  # not collateral
                     found = True
                     break
             if not found:
@@ -1162,19 +1324,55 @@ class EpisodeRunner(object):
                 disturbance += max(
                     0.0, float(np.linalg.norm(piece - origin)) - allowed)
         terms["disturb"] = -w["disturb"] * disturbance
+        # an obstacle pushed toward the red block: no refusal on the
+        # server any more, the reward says it is wrong
+        if (acted_object is not None and not acted_is_target
+                and tb is not None and ta is not None
+                and acted_after is not None):
+            red_b = np.asarray(tb["centroid"][:2], dtype=float)
+            red_a = np.asarray(ta["centroid"][:2], dtype=float)
+            gap_b = float(np.linalg.norm(
+                np.asarray(acted_object["centroid"][:2], dtype=float) - red_b))
+            gap_a = float(np.linalg.norm(acted_after - red_a))
+            closer = gap_b - gap_a - 0.005
+            if closer > 0.0:
+                terms["crowd"] = -w["crowd"] * closer
         terms["lost"] = -w["lost"] * len(lost_objects)
+
+        # ---- the action could not be executed ----
+        # The server says why in push_refused (build 2026-10-22+); older
+        # servers only have push_blocked, which also covers refusals.
+        if primitive == "push" and not info.get("no_obstacle"):
+            if "push_refused" in info:
+                refused = bool(info.get("push_refused"))
+            else:
+                refused = bool(info.get("push_blocked"))
+            if info.get("table_contact"):
+                refused = True      # charged like a refused action
+            if refused:
+                terms["refused"] = -w["refused"]
+                if self.verbose:
+                    print("[rule] the push was refused (%s): %.1f"
+                          % (info.get("push_refused") or "blocked",
+                             terms["refused"]))
 
         # ---- progress toward a graspable target ----
         if tb is not None and ta is not None:
-            cb = route2_perception.clearance_to_obstacles(
+            cb = route2_perception.grasp_clearance(
                 tb, before.get("obstacles", []))
             # An obstacle that left the table must not count as "cleared":
             # for this term it stays where it was. Otherwise knocking the
             # nearest block off the table earned up to +1.6 of clearance
             # against a loss charge of 1.0.
-            ca = route2_perception.clearance_to_obstacles(
+            ca = route2_perception.grasp_clearance(
                 ta, obs_a + lost_objects)
-            terms["clearance"] = w["clearance"] * (ca - cb)
+            # Pay only for the space the grasp needs (the grasp circle plus
+            # 2 cm). Pushing an obstacle far beyond that earns nothing
+            # more; it only sends blocks toward the table edges.
+            cap = self.clearance_min + 0.02
+            terms["clearance"] = w["clearance"] * (min(ca, cap)
+                                                   - min(cb, cap))
+            terms["pose"] = self._pose_value(ta) - self._pose_value(tb)
         seen_b, seen_a = tb is not None, ta is not None
         terms["expose"] = w["expose"] * (int(seen_a) - int(seen_b))
         if not (seen_b and seen_a):
@@ -1187,12 +1385,68 @@ class EpisodeRunner(object):
                         if tb is not None else 0.0)
             if radial > self.max_radial and radial_b <= self.max_radial:
                 terms["outreach"] = -w["outreach"]
+            # too CLOSE is out of reach too: the near table edge
+            if (radial < self.min_radial and tb is not None
+                    and radial_b >= self.min_radial):
+                terms["outreach"] = -w["outreach"]
+        if self.min_radial > 0.0:
+            def inside(o):
+                c = o["centroid"]
+                return float(np.hypot(c[0], c[1])) < self.min_radial
+            n_b = sum(1 for o in obs_b if inside(o))
+            n_a = sum(1 for o in obs_a if inside(o))
+            if n_a > n_b:
+                terms["near_edge"] = -w["near_edge"] * (n_a - n_b)
         return float(sum(terms.values())), terms
+
+    def _pose_value(self, target):
+        """How easy the red block is to grasp where and how it lies, as a
+        number <= 0 (0 = easy). Two parts:
+          * how far it lies in the outer 3 cm of the reach ring (near
+            MIN_RADIAL or MAX_RADIAL), per metre;
+          * for a bar: how much the jaw would have to close ALONG the line
+            to the robot (the tilted fingers then end at different heights,
+            the awkward grasp), 0..1.
+        Used as a potential: the reward is value(after) - value(before), so
+        it cannot be farmed by pushing back and forth."""
+        if target is None:
+            return 0.0
+        c = target["centroid"]
+        radial = float(np.hypot(c[0], c[1]))
+        lo, hi = self.min_radial + 0.03, self.max_radial - 0.03
+        edge = max(0.0, lo - radial) + max(0.0, radial - hi)
+        angle = 0.0
+        long_side, short_side = target.get("rect_long"), \
+            target.get("rect_short")
+        if (target.get("yaw") is not None and long_side and short_side
+                and long_side / max(short_side, 1e-3) > 1.3):
+            closing = float(target["yaw"]) + np.pi / 2.0
+            azimuth = float(np.arctan2(c[1], c[0]))
+            angle = abs(np.cos(closing - azimuth))
+        return -(self.w["pose_edge"] * edge + self.w["pose_angle"] * angle)
 
     def _feasibility(self, view):
         return route2_perception.grasp_feasibility(
             view, clearance_min=self.clearance_min,
-            max_radial=self.max_radial)
+            max_radial=self.max_radial, min_radial=self.min_radial)
+
+    def _point_at_anchor(self):
+        """Hold the closed gripper 8 cm above the anchor so the person
+        setting the scene sees exactly where the red block goes. One move;
+        the caller sends the arm home before the photo. False if the arm
+        cannot (or should not) do it."""
+        if self.route2 is None or not self.show_anchor:
+            return False
+        try:
+            anchor = np.asarray(self.route2.anchor, dtype=float)
+            table_z = float(self.route2.backend.config.table_z)
+            self.env._send({"cmd": "gripper", "state": "close"})
+            resp = self.env._send({"cmd": "goto", "xyz": [
+                float(anchor[0]), float(anchor[1]), table_z + 0.08]})
+            return bool(resp.get("ok"))
+        except Exception as error:
+            print("[scene] could not point at the anchor (%s)" % error)
+            return False
 
     def _start_problem(self, summary):
         """Why this scene is not worth starting an episode on, or None."""
@@ -1201,6 +1455,11 @@ class EpisodeRunner(object):
         if summary.get("n_objects", 0) == 0:
             return "empty"
         if summary.get("target_found"):
+            c = summary["target"]["centroid"]
+            radial = float(np.hypot(c[0], c[1]))
+            # (no position check: the red block stays where it was put;
+            # pushes that cannot be done are refused and charged)
+            pass
             return ("graspable" if self._feasibility(summary)["graspable"]
                     else None)
         if self.last_end == "target_lost":
@@ -1209,7 +1468,16 @@ class EpisodeRunner(object):
             return "unseen"
         return None
 
-    PROBLEM_TEXT = {
+    reach_note = ""
+
+    @property
+    def PROBLEM_TEXT(self):
+        return dict(self._PROBLEM_TEXT, reach=(
+            self.reach_note + " From there almost every push starts out of "
+            "the arm's reach and is refused, so nothing can be learned. "
+            "Move the scene under the gripper."))
+
+    _PROBLEM_TEXT = {
         "empty": "The camera sees nothing on the table.",
         "graspable": "The red block can already be grasped as it lies. "
                      "There is nothing to clear, so nothing to learn.",
@@ -1224,8 +1492,27 @@ class EpisodeRunner(object):
         and make sure the scene is worth an episode. With --pause 1 the
         script waits here, arm parked, until a human has rebuilt a scene
         that is not trivial."""
+        self.ep_t = 0
+        first = True
         while True:
             obs = self.env.reset()
+            used_up = self.last_end in (None, "success", "target_lost",
+                                        "outreach", "cleanup")
+            if first and (self.reset_prompt >= 2
+                          or (self.reset_prompt == 1 and used_up)):
+                pointing = self._point_at_anchor()
+                answer = ask_human(
+                    "SETUP", "%s %s Take your hands away, then press "
+                    "Enter." % (
+                        "The gripper is pointing at the spot: put the red "
+                        "block right under it." if pointing else
+                        "The arm is parked.", self.scene_text))
+                self.stuck = False
+                if pointing:
+                    obs = self.env.reset()      # arm home before the photo
+                if answer == "q":
+                    raise StopTraining("stopped at the scene setup")
+            first = False
             self.home_state = np.array(obs["state"][:PROPRIO_DIM],
                                        dtype=np.float32)
             self.image_size = int(obs["rgb"].shape[0])
@@ -1252,11 +1539,14 @@ class EpisodeRunner(object):
                 print("[scene]   %s at (%.2f, %.2f)"
                       % (d.get("label", "object"), d["centroid"][0],
                          d["centroid"][1]))
+            pointing = self._point_at_anchor()
             answer = ask_human(
                 "SCENE", "%s The arm is parked and will not move. Rebuild "
                 "the clutter (red block hidden or boxed in by the others, "
                 "all inside the reachable band), take your hands away, "
                 "then press Enter." % self.PROBLEM_TEXT[problem])
+            if pointing:
+                self.env.reset()
             if answer == "q":
                 raise StopTraining("stopped at the scene check")
             if answer == "g":
@@ -1291,6 +1581,7 @@ class EpisodeRunner(object):
     def _end_episode(self, end):
         """Book-keeping the next start_episode needs."""
         self.last_end = end
+        self.ep_refused = 0
         self.blind_episodes = (0 if self.saw_target or end == "success"
                                else self.blind_episodes + 1)
         self.view = None
@@ -1361,6 +1652,10 @@ class EpisodeRunner(object):
             except Exception as error:
                 print("[route2] WARNING: perceive failed (%s); the server "
                       "will fall back to its own point cloud" % error)
+
+        if (not is_pick and self.push_frame == "relative" and perception
+                and perception.get("pushables")):
+            to_server[2:4] = self._world_direction(action, perception)
 
         after, clean = None, False
         shaping, shaping_terms = 0.0, {}
@@ -1575,6 +1870,11 @@ class EpisodeRunner(object):
             done = True
         if target_lost or outreach_hit or cleanup_end:
             done = True
+        self.ep_t += 1
+        if shaping_terms.get("refused"):
+            self.ep_refused += 1
+        if self.max_ep_steps and self.ep_t >= self.max_ep_steps:
+            done = True             # time limit: NOT terminal
         # "cleanup" ends the episode but is not a terminal state of the
         # task (nothing the policy did decided it), so it bootstraps like
         # a time limit.
@@ -1599,7 +1899,7 @@ class EpisodeRunner(object):
         if is_pick:
             push_dir, push_dist = (None, None), None
         else:
-            d = np.asarray(action[2:4], dtype=float)
+            d = np.asarray(to_server[2:4], dtype=float)
             n = float(np.linalg.norm(d))
             push_dir = ((d / n).tolist() if n > 1e-6 else (None, None))
             push_dist = info.get("push_distance")
@@ -1639,6 +1939,11 @@ class EpisodeRunner(object):
             "r_disturb": round(shaping_terms.get("disturb", 0.0), 4),
             "r_lost": round(shaping_terms.get("lost", 0.0), 4),
             "r_outreach": round(shaping_terms.get("outreach", 0.0), 4),
+            "r_refused": round(shaping_terms.get("refused", 0.0), 4),
+            "r_near_edge": round(shaping_terms.get("near_edge", 0.0), 4),
+            "r_pose": round(shaping_terms.get("pose", 0.0), 4),
+            "r_hit_target": round(shaping_terms.get("hit_target", 0.0), 4),
+            "r_crowd": round(shaping_terms.get("crowd", 0.0), 4),
             "motion_errors": " | ".join(info.get("motion_errors", [])),
             "r_target_lost": round(shaping_terms.get("target_lost", 0.0), 4),
             "target_lost": target_lost,
@@ -1708,6 +2013,89 @@ def open_csv(path, columns):
     return handle, writer
 
 
+# command-line name -> server config name, and the value used when the
+# server is too old to report it
+SERVER_PARAMS = [
+    ("table_z", "TABLE_Z", 0.225),
+    ("ws_x_min", "WS_X_MIN", 0.28), ("ws_x_max", "WS_X_MAX", 0.60),
+    ("ws_y_min", "WS_Y_MIN", -0.25), ("ws_y_max", "WS_Y_MAX", 0.25),
+    ("max_radial", "MAX_RADIAL", 0.38), ("min_radial", "MIN_RADIAL", 0.0),
+    ("grasp_clearance", "GRASP_CLEARANCE", 0.06),
+    ("target_max_extent", "TARGET_MAX_EXTENT", 0.085),
+]
+
+
+MIN_SERVER_BUILD = "2026-10-29g"   # jaw closed once, never opened
+PUSH_RED = False      # set from --push_red in main()
+
+
+def params_from_server(env, args):
+    """Fill the geometry arguments from the server's stored calibration.
+    Stops when a value given on the command line disagrees with it."""
+    try:
+        build = env._send({"cmd": "ping"}).get("build") or ""
+    except Exception:
+        build = ""
+    if build and build < MIN_SERVER_BUILD:
+        raise SystemExit(
+            "[params] the robot runs server build %s; this script needs %s "
+            "or newer. Copy the new grasp_env_server_rgbd.py to the robot "
+            "and restart it:\n    scp grasp_env_server_rgbd.py "
+            "locobot@locobot.local:~/\n    (robot) source ~/server_env.sh "
+            "&& python ~/grasp_env_server_rgbd.py" % (build, MIN_SERVER_BUILD))
+    print("[params] robot server build %s" % (build or "unknown"))
+    try:
+        state = env._send({"cmd": "get_config"})
+        config = state.get("config") or {}
+        meta = state.get("meta") or {}
+    except Exception as error:
+        print("[params] WARNING: the server does not report its settings "
+              "(%s); using command-line values and old defaults" % error)
+        config, meta = {}, {}
+    clashes, missing = [], []
+    for flag, key, fallback in SERVER_PARAMS:
+        given = getattr(args, flag)
+        if key in config:
+            value = float(config[key])
+            if given is not None and abs(float(given) - value) > 0.005:
+                clashes.append("--%s %.3f but the server has %s=%.3f"
+                               % (flag, given, key, value))
+            setattr(args, flag, value)
+        else:
+            if given is None:
+                setattr(args, flag, fallback)
+                missing.append(key)
+    if "TARGET_X" in config and "TARGET_Y" in config:
+        anchor = (float(config["TARGET_X"]), float(config["TARGET_Y"]))
+        if args.anchor is not None:
+            ax, ay = (float(v) for v in args.anchor.split(","))
+            if abs(ax - anchor[0]) > 0.005 or abs(ay - anchor[1]) > 0.005:
+                clashes.append("--anchor %s but the server has %.3f,%.3f"
+                               % (args.anchor, anchor[0], anchor[1]))
+        args.anchor = "%.3f,%.3f" % anchor
+    elif args.anchor is None:
+        args.anchor, missing = "0.40,0.03", missing + ["TARGET_X/Y"]
+    if clashes:
+        raise SystemExit(
+            "[params] the command line disagrees with the robot server:\n  "
+            + "\n  ".join(clashes) +
+            "\nThe server holds the calibrated numbers. Remove these flags "
+            "from the command (the script reads them from the server), or "
+            "run calibrate_all.py again if the table or camera was moved.")
+    if missing:
+        print("[params] WARNING: the server does not report %s (old "
+              "server build); defaults used" % ", ".join(missing))
+    print("[params] from the robot server%s:"
+          % (" (calibrated %s)" % meta["saved_at"]
+             if meta.get("saved_at") else ""))
+    print("[params]   table_z=%.3f  work area x %.2f..%.2f  y %.2f..%.2f  "
+          "anchor=%s" % (args.table_z, args.ws_x_min, args.ws_x_max,
+                         args.ws_y_min, args.ws_y_max, args.anchor))
+    print("[params]   reach %.2f..%.2f m  grasp circle %.3f m  target max "
+          "size %.3f m" % (args.min_radial, args.max_radial,
+                           args.grasp_clearance, args.target_max_extent))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="locobot.local")
@@ -1775,28 +2163,46 @@ def main(argv=None):
                              "well below the spacing between objects: at 0.10 "
                              "it equals that spacing and will grab the wrong "
                              "object when the target is occluded.")
-    parser.add_argument("--anchor", default="0.40,0.03",
-                        help="the object nearest this x,y is the target at "
-                             "each reset; keep equal to the server's "
-                             "TARGET_X,TARGET_Y")
-    parser.add_argument("--table_z", type=float, default=0.225,
-                        help="support surface height; keep equal to the "
-                             "server's TABLE_Z")
-    parser.add_argument("--ws_x_min", type=float, default=0.28)
-    parser.add_argument("--ws_x_max", type=float, default=0.60)
-    parser.add_argument("--ws_y_min", type=float, default=-0.25)
-    parser.add_argument("--ws_y_max", type=float, default=0.25)
+    # The geometry below is NOT given on the command line any more. It is
+    # read from the robot server at start-up, which holds the numbers that
+    # calibrate_all.py measured and saved. One set of numbers, one place.
+    # A flag given here must agree with the server (within 5 mm), otherwise
+    # the run stops; that catches a stale copy-pasted command.
+    parser.add_argument("--anchor", default=None,
+                        help="(from the server: TARGET_X,TARGET_Y)")
+    parser.add_argument("--table_z", type=float, default=None,
+                        help="(from the server: TABLE_Z)")
+    parser.add_argument("--ws_x_min", type=float, default=None)
+    parser.add_argument("--ws_x_max", type=float, default=None)
+    parser.add_argument("--ws_y_min", type=float, default=None)
+    parser.add_argument("--ws_y_max", type=float, default=None)
+    parser.add_argument("--min_radial", type=float, default=None,
+                        help="(from the server: MIN_RADIAL) inner reach "
+                             "limit; the near table edge")
     parser.add_argument("--grasp_trigger", choices=["auto", "policy"],
                         default="auto",
                         help="auto: the scripted grasp runs by rule as soon "
                              "as the target is graspable (the policy only "
                              "clears). policy: a[0]>=0 grasps the target "
                              "(ablation).")
-    parser.add_argument("--grasp_clearance", type=float, default=0.06,
+    parser.add_argument("--grasp_clearance", type=float, default=None,
                         help="radius (m) of the circle drawn at the target's "
                              "xy centroid; the grasp rule fires only when no "
                              "obstacle point lies inside this circle")
-    parser.add_argument("--max_radial", type=float, default=0.38,
+    parser.add_argument("--graspable_rule", choices=["fingers", "circle"],
+                        default="fingers",
+                        help="fingers (default, Oct 30): only the two places "
+                             "where the fingers come down, along the closing "
+                             "direction the grasp will use, must be free out "
+                             "to --grasp_clearance from the target centre. "
+                             "circle: the old rule, nothing within "
+                             "--grasp_clearance in any direction. The "
+                             "clearance reward uses the same measure")
+    parser.add_argument("--finger_half_width", type=float, default=0.015,
+                        help="half width (m) of the strip each finger needs, "
+                             "measured across the closing direction: half "
+                             "the finger's width plus a margin")
+    parser.add_argument("--max_radial", type=float, default=None,
                         help="largest radial distance the planner grasp "
                              "can reach at the configured pitch; from "
                              "reach_scan.py")
@@ -1816,7 +2222,7 @@ def main(argv=None):
     parser.add_argument("--dump_every", type=int, default=1,
                         help="save every N-th frame when --dump_frames is "
                              "set")
-    parser.add_argument("--target_max_extent", type=float, default=0.085,
+    parser.add_argument("--target_max_extent", type=float, default=None,
                         help="max XY size (m) a detection may have and "
                              "still be the target. A single block is under "
                              "0.07; merged piles measured 0.095+ on the "
@@ -1830,6 +2236,46 @@ def main(argv=None):
                              "(target already graspable, target gone, "
                              "table empty). The arm is parked while it "
                              "waits. 0: never wait (tests, mock runs).")
+    parser.add_argument("--max_ep_steps", type=int, default=3,
+                        help="episode length in steps (pushes). The easy "
+                             "3-block scene needs 1 push; 3 leaves room for "
+                             "one mistake and one correction. 0 = the "
+                             "server's HORIZON")
+    parser.add_argument("--push_frame", choices=["relative", "world"],
+                        default="relative",
+                        help="relative: a[2:4] is the push direction in the "
+                             "chosen object's frame, x = straight away from "
+                             "the red block")
+    parser.add_argument("--reset_prompt", type=int, default=1,
+                        help="when to ask you to set the scene by hand. "
+                             "1 (default): only when the last episode used "
+                             "it up (success: the red block was taken away; "
+                             "red off the table or out of reach) and at the "
+                             "very start. After a plain time limit the "
+                             "blocks stay where they are and the next "
+                             "episode starts from there. 2: every episode. "
+                             "0: never")
+    parser.add_argument("--scene", default="Put the red block {where}, "
+                        "with one other-coloured block touching it on each "
+                        "side, in a row ACROSS the line from the robot to "
+                        "the red block (green, red, green).",
+                        help="what the setup prompt asks you to build")
+    parser.add_argument("--push_red", type=int, default=0,
+                        help="0 (default): the red block is never pushed; "
+                             "the policy only pushes obstacles away from it. "
+                             "1: the red block may be pushed as well")
+    parser.add_argument("--show_anchor", type=int, default=0,
+                        help="1: while you set the scene, the gripper "
+                             "hovers 8 cm over the anchor to show where the "
+                             "red block goes. Off by default")
+    parser.add_argument("--demo_episodes", type=int, default=0,
+                        help="episodes at the start that use the scripted "
+                             "move (push the obstacle nearest to red "
+                             "straight away from it, a little noise) "
+                             "instead of random actions. They go into the "
+                             "replay buffer like any other data, so the "
+                             "critic sees successes from the first minute. "
+                             "Skipped when resuming or loading weights")
     parser.add_argument("--max_blind_episodes", type=int, default=3,
                         help="pause after this many episodes in a row in "
                              "which the target was never seen")
@@ -1880,6 +2326,16 @@ def main(argv=None):
                 and os.path.isfile(args.save_replay):
             args.load_replay = args.save_replay
 
+    global PUSH_RED
+    PUSH_RED = bool(args.push_red)
+    env = RemoteEnv(args.host, args.port)
+    params_from_server(env, args)
+    ax, ay = (float(v) for v in args.anchor.split(","))
+    args.scene = args.scene.replace(
+        "{where}", "%.0f cm in front of the robot centre and %.0f cm to its "
+        "%s (the anchor)" % (ax * 100, abs(ay) * 100,
+                             "right" if ay < 0 else "left"))
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -1896,14 +2352,30 @@ def main(argv=None):
              args.allow_pick,
              "n/a" if args.one_action else args.grasp_retries, args.resume))
 
+    route2_perception.set_grasp_rule(args.graspable_rule,
+                                     args.finger_half_width)
+    print("[train] graspable rule: %s (%s)"
+          % (args.graspable_rule,
+             "the two finger places along the closing direction free out to "
+             "%.0f mm, strip %.0f mm wide"
+             % ((args.grasp_clearance or 0.06) * 1000,
+                2 * args.finger_half_width * 1000)
+             if args.graspable_rule == "fingers" else
+             "no obstacle point within %.0f mm of the target centre"
+             % ((args.grasp_clearance or 0.06) * 1000)))
     route2 = None if args.perception == "off" else build_route2(args)
-    env = RemoteEnv(args.host, args.port)
     try:
         runner = EpisodeRunner(env, route2, dump_dir=args.dump_frames,
                                dump_every=args.dump_every,
                                grasp_trigger=args.grasp_trigger,
                                clearance_min=args.grasp_clearance,
                                max_radial=args.max_radial,
+                               min_radial=args.min_radial,
+                               max_ep_steps=args.max_ep_steps,
+                               push_frame=args.push_frame,
+                               reset_prompt=args.reset_prompt,
+                               scene_text=args.scene,
+                               show_anchor=bool(args.show_anchor),
                                credit_clear_grasp=bool(
                                    args.credit_clear_grasp),
                                weights={k: getattr(args, "w_%s" % k)
@@ -1969,6 +2441,14 @@ def main(argv=None):
             warmup = step0 + max(0, args.warmup - step0)
         else:
             warmup = args.warmup if args.load is None else 0
+        demo_left = (args.demo_episodes
+                     if not (args.resume or args.load) else 0)
+        if demo_left:
+            warmup = 0        # the demonstrations replace the random steps
+            print("[train] the first %d episodes use the scripted move "
+                  "(demonstrations); learning starts after them"
+                  % demo_left)
+        recent = []           # (success, length) of the last episodes
         episode_return, episode_length = 0.0, 0
         episode_i = episode0 + 1
         grasps, pushes = 0, 0
@@ -2000,7 +2480,10 @@ def main(argv=None):
         finished = False
         try:
             for step in range(step0 + 1, step0 + args.steps + 1):
-                if step <= warmup:
+                if demo_left > 0:
+                    action = runner.scripted_action()
+                    warmup = max(warmup, step)   # no updates yet
+                elif step <= warmup:
                     action = np.random.uniform(
                         -1, 1, ACT_DIM).astype(np.float32)
                 else:
@@ -2049,7 +2532,9 @@ def main(argv=None):
                     record["r_shaping"], record["r_clearance"],
                     record["r_expose"], record["r_split"],
                     record["r_disturb"], record["r_lost"],
-                    record["r_outreach"], int(done),
+                    record["r_outreach"], record["r_refused"],
+                    record["r_near_edge"], record["r_pose"],
+                    record["r_hit_target"], record["r_crowd"], int(done),
                     record["motion_errors"],
                     record["r_target_lost"], int(record["target_lost"]),
                     int(record["terminal"]), record["grasp_attempts"]])
@@ -2060,11 +2545,20 @@ def main(argv=None):
                         agent.update(replay.sample(args.batch, device))
 
                 if done:
-                    print("[ep %3d] step=%4d return=%7.2f len=%2d "
-                          "end=%s grasp=%d push=%d"
-                          % (episode_i, step, episode_return,
-                             episode_length, record["end"],
-                             grasps, pushes))
+                    kind = "demo" if demo_left > 0 else "policy"
+                    if demo_left > 0:
+                        demo_left -= 1
+                    else:
+                        recent.append((int(record["success"]),
+                                       episode_length))
+                    last = recent[-10:]
+                    rate = ("%d/%d" % (sum(r[0] for r in last), len(last))
+                            if last else "-")
+                    print("[ep %3d] %-6s step=%4d return=%7.2f len=%2d "
+                          "end=%-11s push=%d | last 10 policy episodes: "
+                          "success %s"
+                          % (episode_i, kind, step, episode_return,
+                             episode_length, record["end"], pushes, rate))
                     episode_writer.writerow([
                         time.time(), step, episode_i, episode_return,
                         episode_length, int(record["success"]),
