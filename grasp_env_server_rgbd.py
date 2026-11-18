@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-grasp_env_server.py
+grasp_env_server_rgbd.py
 
 Runs ON THE ROBOT inside the pyrobot Python 3.6 env:
     load_pyrobot_env
-    python ~/grasp_env_server.py
+    python ~/grasp_env_server_rgbd.py
 
 Requires in another terminal:
     roslaunch locobot_control main.launch use_arm:=true use_camera:=true
@@ -35,6 +35,10 @@ Protocol: newline-delimited JSON over TCP (port 9999).
       the terms the server can compute (push cost, motion failures, gripper
       result). The client adds the perception-based terms (clearance gain,
       obstacle removal, target-lost penalty, success confirmation) itself.
+  {"cmd":"check_actions","actions":[...],"perception":{...}}
+      Checks push plans with solve-only IK; returns a mask and reasons.
+      A checked push can be sent via step with "require_ik":true to recheck
+      the nominal waypoints immediately before execution.
   {"cmd":"ee"}                            -> current EE position (debug)
   {"cmd":"goto","xyz":[x,y,z]}            -> move EE there, pitch down (debug)
   {"cmd":"goto_pregrasp"}                 -> move EE to the pre-grasp pose
@@ -116,6 +120,7 @@ This server is a DUMB EXECUTOR:
 from __future__ import print_function
 
 import base64
+import copy
 import json
 import os
 import socket
@@ -383,7 +388,7 @@ TABLE_Z = float(os.environ.get("TABLE_Z", "0.225"))
 # the way in in _ee_pos, so nothing else in the code has to know two frames
 # exist. Calibrate it with z_calibrate.py (hover at a commanded height,
 # measure the fingertip-to-table gap with a ruler, solve).
-SERVER_BUILD = "2026-10-29g"
+SERVER_BUILD = "2026-11-18-ik"
 ARM_Z_OFFSET = float(os.environ.get("ARM_Z_OFFSET", "0.0"))
 # The same reconciliation, extended. calibrate_all.py photographs the
 # fingertips against a block at several places on the table and fits the
@@ -1415,7 +1420,7 @@ class GraspEnv(object):
                 sample["rgb_stamp"] - sample["depth_stamp"]),
         }
 
-    def apply_external_perception(self, payload):
+    def apply_external_perception(self, payload, verbose=True):
         """Overwrite target/obstacle state with client-supplied perception.
 
         The training client computes object centroids from the full frame
@@ -1451,10 +1456,11 @@ class GraspEnv(object):
                           if self.target_visible else None)
         self.target_clearance = self._clearance_to_obstacles(
             target_cluster, self.obstacles)
-        print("[external] target=%s obstacles=%d clearance=%.3f"
-              % (None if not self.target_visible else
-                 np.round(self.target_centroid, 3).tolist(),
-                 len(self.obstacles), self.target_clearance))
+        if verbose:
+            print("[external] target=%s obstacles=%d clearance=%.3f"
+                  % (None if not self.target_visible else
+                     np.round(self.target_centroid, 3).tolist(),
+                     len(self.obstacles), self.target_clearance))
         # Push candidates. When the client sends "pushables" (target first
         # when it is visible, then the obstacles), the push selector indexes
         # that list, so pushing the target out of a pile is a legal action.
@@ -1929,17 +1935,12 @@ class GraspEnv(object):
             t += 0.005
         return min(ok, allowed) if t <= allowed + 1e-9 else allowed
 
-    def scripted_push(self, obstacle, direction, distance, is_target=False):
-        """Push one selected object in XY. Returns (completed, blocked).
-        is_target: the object being pushed IS the target, so the rule that
-        refuses a push whose path crosses the target does not apply."""
-        # Reset first, so a push that is refused before it starts reports
-        # steps=0 and a "refused" reason instead of the previous push's
-        # numbers. The client charges a refused action (the arm did not
-        # move) more than a plain step; see DEFAULT_W["refused"].
-        self.last_push = {"steps": 0, "stopped": "", "advance": 0.0,
-                          "refused": ""}
+    def _plan_push(self, obstacle, direction, distance, is_target=False,
+                   verbose=False):
+        """Compute a push stroke from scene geometry, without moving."""
         direction = np.asarray(direction, dtype=float)
+        if not np.all(np.isfinite(direction)) or not np.isfinite(distance):
+            raise ValueError("non-finite push parameters")
         norm = float(np.linalg.norm(direction))
         if norm < 0.15:
             direction = (obstacle["centroid"][:2]
@@ -1971,22 +1972,14 @@ class GraspEnv(object):
             # perpendicular, and a touching neighbour then comes a few mm
             # closer at the start of the stroke.
             if closest < target_radius and closest < start_gap - 0.010:
-                print("[push] blocked: predicted path crosses target")
-                self.last_push["refused"] = "path crosses the target"
-                return False, True
+                return None, "path crosses the target"
 
         start_xy = center - direction * (half_width + PUSH_TOOL_OFFSET)
         # The reach scan measured 0.42 m at pitch 1.0. The start point may
         # lie PUSH_START_SLACK beyond MAX_RADIAL; whether the arm really
         # gets there is then the IK's decision (a refusal costs no motion).
         if float(np.linalg.norm(start_xy)) > MAX_RADIAL + PUSH_START_SLACK:
-            self._log_motion(
-                "push start %s is at radial %.2f, beyond %.2f"
-                % (np.round(start_xy, 3).tolist(),
-                   float(np.linalg.norm(start_xy)),
-                   MAX_RADIAL + PUSH_START_SLACK))
-            self.last_push["refused"] = "start beyond reach"
-            return False, True
+            return None, "start beyond reach"
         # Where the fingertips stop. The closed jaw meets the object at its
         # NEAR face (centre - half_width) and should carry that face forward
         # by `distance`, so the object moves by `distance`.
@@ -2009,8 +2002,9 @@ class GraspEnv(object):
             t = (-b + np.sqrt(max(disc, 0.0)))
             t = max(t, reach_past_centre - distance + PUSH_MIN_DISTANCE)
             end_xy = c + direction * t
-            print("[push] end shortened to radial %.2f (was %.2f)"
-                  % (float(np.linalg.norm(end_xy)), end_radial))
+            if verbose:
+                print("[push] end shortened to radial %.2f (was %.2f)"
+                      % (float(np.linalg.norm(end_xy)), end_radial))
         # Keep the pushed object on the usable table. Two limits:
         #  * the inner reach limit MIN_RADIAL (+2 cm, a pushed block slides
         #    on a little): near the robot the arm hit the table going home;
@@ -2048,15 +2042,12 @@ class GraspEnv(object):
                 allowed, why = on_table, "off the edge of the table"
         if allowed < distance:
             if allowed < 0.5 * PUSH_MIN_DISTANCE:
-                self._log_motion(
-                    "push refused: it would move the object at %s %s"
-                    % (np.round(c, 3).tolist(), why))
-                self.last_push["refused"] = "toward the table edge"
-                return False, True
+                return None, "toward the table edge (%s)" % why
             shorten = distance - allowed
             end_xy = end_xy - direction * shorten
-            print("[push] shortened by %.0f mm: the object would end %s"
-                  % (shorten * 1000, why))
+            if verbose:
+                print("[push] shortened by %.0f mm: the object would end %s"
+                      % (shorten * 1000, why))
         if self._inside_table(c) is None:
             # Only without a table outline: keep the fingers in the box.
             # (Clipping the START into the box moves it toward the object
@@ -2078,19 +2069,114 @@ class GraspEnv(object):
         # (Build 29e pushed with the jaw open and checked both open
         # fingertips here; 29f is back to a closed jaw, one contact point.)
         start_xy = np.asarray(start_xy, dtype=float)
-        finger_drop = 0.0
-        push_z = PUSH_EE_Z
-        occupied = self._object_at(start_xy, center)
-        if occupied is not None:
-            self._log_motion(
-                "push refused: the fingers would come down at %s, on top "
-                "of another object at %s. Push from a side that has room."
-                % (np.round(start_xy, 3).tolist(),
-                   np.round(occupied, 3).tolist()))
-            self.last_push["stopped"] = "no room for the fingers"
-            self.last_push["refused"] = "no room for the fingers"
+        if self._object_at(start_xy, center) is not None:
+            return None, "no room for the fingers"
+
+        sweep = np.asarray(end_xy, dtype=float) - start_xy
+        length = float(np.linalg.norm(sweep))
+        along = sweep / length if length > 1e-6 else direction
+        return (start_xy, along, length, direction), ""
+
+    @staticmethod
+    def _push_waypoint(start_xy, along, travel, z):
+        xy = start_xy + along * travel
+        return [float(xy[0]), float(xy[1]), z]
+
+    @staticmethod
+    def _push_travels(length):
+        """Nominal stroke distances in execution order."""
+        travel = 0.0
+        free = min(max(0.0, PUSH_TOOL_OFFSET - 0.010), length)
+        if free > PUSH_STEP:
+            travel = free
+            yield travel, True
+        step = max(PUSH_STEP, 0.001)
+        while travel < length - 1e-6:
+            travel = min(length, travel + step)
+            yield travel, False
+
+    def _push_ik_failure(self, plan, seed):
+        """Return a reason for the first failed nominal pose, without motion."""
+        start, along, length, _ = plan
+        z = PUSH_EE_Z
+        hover = z + PUSH_APPROACH_DZ
+        offset, _, _ = self.arm.get_transform(
+            self.arm.configs.ARM.ARM_BASE_FRAME, "arm_base_link")
+        poses = [("approach", 0.0, hover), ("descend", 0.0, z)]
+        poses.extend(("stroke", travel, z)
+                     for travel, _ in self._push_travels(length))
+        poses.append(("retreat", length, hover))
+        for phase, travel, height in poses:
+            xyz = self._push_waypoint(start, along, travel, height)
+            if height < HARD_Z_MIN:
+                return "%s below minimum Z" % phase
+            wrist = self._wrist_for_fingertip(xyz, GRASP_PITCH)
+            # Match the yaw/pitch/roll convention of LoCoBotArm's
+            # set_ee_pose_pitch_roll, using the calibrated wrist position.
+            yaw = np.arctan2(wrist[1] - offset[1], wrist[0] - offset[0])
+            orientation = np.array([yaw, GRASP_PITCH, GRASP_ROLL])
+            joints = self.arm.compute_ik(
+                wrist, orientation, qinit=seed, numerical=IK_NUMERICAL)
+            if joints is None or not np.all(np.isfinite(joints)):
+                return "%s unreachable at %.0f mm" % (phase, travel * 1000)
+            seed = joints
+        return ""
+
+    @staticmethod
+    def _decode_push(action, pool):
+        selector = 0.5 * (action[1] + 1.0)
+        index = min(int(selector * len(pool)), len(pool) - 1)
+        distance = PUSH_MIN_DISTANCE + 0.5 * (action[4] + 1.0) * (
+            PUSH_MAX_DISTANCE - PUSH_MIN_DISTANCE)
+        return index, pool[index], action[2:4], float(distance)
+
+    def check_actions(self, actions, perception):
+        """Check a batch against a single scene and arm pose."""
+        # Perception assignment replaces arrays/lists. A shallow copy keeps
+        # the live episode state untouched while sharing the arm's solver.
+        scene = copy.copy(self)
+        scene.apply_external_perception(perception, verbose=False)
+        pool = scene.pushables if scene.pushables is not None else scene.obstacles
+        seed = self._joints()
+        reasons = []
+        for action in actions:
+            action = np.asarray(action, dtype=float)
+            if (action.shape != (5,) or not np.all(np.isfinite(action))
+                    or action[0] >= 0.0):
+                reasons.append("expected a finite five-value push")
+                continue
+            if not pool:
+                reasons.append("no pushable object")
+                continue
+            action = np.clip(action, -1.0, 1.0)
+            _, chosen, direction, distance = self._decode_push(action, pool)
+            plan, reason = scene._plan_push(
+                chosen, direction, distance, bool(chosen.get("is_target")))
+            if plan is not None:
+                reason = scene._push_ik_failure(plan, seed)
+            reasons.append(reason)
+        return {"ok": True, "mask": [not reason for reason in reasons],
+                "reasons": reasons}
+
+    def scripted_push(self, obstacle, direction, distance, is_target=False,
+                      require_ik=False):
+        """Push one selected object in XY. Returns (completed, blocked)."""
+        self.last_push = {"steps": 0, "stopped": "", "advance": 0.0,
+                          "refused": ""}
+        plan, reason = self._plan_push(
+            obstacle, direction, distance, is_target, verbose=True)
+        if plan is not None and require_ik:
+            reason = self._push_ik_failure(plan, self._joints())
+        if reason:
+            self._log_motion("push refused: " + reason)
+            self.last_push["refused"] = reason
+            if reason == "no room for the fingers":
+                self.last_push["stopped"] = reason
             return False, True
 
+        start_xy, along, length, direction = plan
+        finger_drop = 0.0
+        push_z = PUSH_EE_Z
         # Fingers CLOSED before the arm comes down (the arm is still at
         # home here): one contact point, no finger slipping past the block.
         #
@@ -2112,13 +2198,8 @@ class GraspEnv(object):
         if self.gripper_flag < 0.5:
             self._close_gripper()
         up = push_z + PUSH_APPROACH_DZ
-        sweep = np.asarray(end_xy, dtype=float) - start_xy
-        length = float(np.linalg.norm(sweep))
-        along = sweep / length if length > 1e-6 else direction
-
         def at(travel, z=push_z):
-            xy = start_xy + along * travel
-            return [float(xy[0]), float(xy[1]), z]
+            return self._push_waypoint(start_xy, along, travel, z)
 
         def tip_along():
             return float(np.dot(
@@ -2174,24 +2255,21 @@ class GraspEnv(object):
                           (PUSH_EE_Z - TABLE_Z) * 1000))
             self.last_push["table_contact"] = True
         if ok2 and not stopped:
-            # free travel: up to 1 cm before the face, in one move
-            free = min(max(0.0, PUSH_TOOL_OFFSET - 0.010), length)
-            if free > PUSH_STEP:
-                if self._goto_xyz(at_h(free), settle=PUSH_STEP_PAUSE,
-                                  correct=False, quiet=True, any_xy=True):
-                    travel = free
-                    hold_height()
-                else:
-                    stopped = "the arm could not start the stroke"
-            # contact: small steps, a stop after each
             last, slow = tip_along(), 0
             step = max(PUSH_STEP, 0.001)
-            while not stopped and travel < length - 1e-6:
-                target = min(length, travel + step)
+            for target, free_travel in self._push_travels(length):
                 reached = self._goto_xyz(at_h(target),
                                          settle=PUSH_STEP_PAUSE,
                                          correct=False, quiet=True,
                                          any_xy=True)
+                if free_travel:
+                    if not reached:
+                        stopped = "the arm could not start the stroke"
+                        break
+                    travel = target
+                    hold_height()
+                    last = tip_along()
+                    continue
                 now = tip_along()
                 moved, last = now - last, now
                 steps += 1
@@ -2326,7 +2404,8 @@ class GraspEnv(object):
                 "home_joints": (None if self.home_joints is None else
                                 self.home_joints.tolist())}
 
-    def step(self, action, perception=None, grasp_role="target"):
+    def step(self, action, perception=None, grasp_role="target",
+             require_ik=False):
         """Execute one primitive and report the physical outcome only.
 
         grasp_role decides what action[0] >= 0 means:
@@ -2383,15 +2462,12 @@ class GraspEnv(object):
                 # the client applies the uniform push step cost regardless.
                 info["no_obstacle"] = True
             else:
-                selector = 0.5 * (a[1] + 1.0)
-                obstacle_index = min(int(selector * len(pool)),
-                                     len(pool) - 1)
-                chosen = pool[obstacle_index]
+                obstacle_index, chosen, direction, distance = (
+                    self._decode_push(a, pool))
                 is_target = bool(chosen.get("is_target", False))
-                distance = PUSH_MIN_DISTANCE + 0.5 * (a[4] + 1.0) * (
-                    PUSH_MAX_DISTANCE - PUSH_MIN_DISTANCE)
                 completed, blocked = self.scripted_push(
-                    chosen, a[2:4], distance, is_target=is_target)
+                    chosen, direction, distance, is_target=is_target,
+                    require_ik=require_ik)
                 info.update({"obstacle_index": obstacle_index,
                              "pushed_target": is_target,
                              "push_completed": completed,
@@ -2480,6 +2556,7 @@ def serve():
                     cmd = msg.get("cmd")
                     if cmd == "ping":
                         resp = {"ok": True, "build": SERVER_BUILD,
+                                "check_actions": True,
                                 "file": os.path.abspath(__file__)}
                     elif cmd == "get_config":
                         resp = {"ok": True, "config": current_config(),
@@ -2508,10 +2585,13 @@ def serve():
                     elif cmd == "reset":
                         resp = env.reset()
                         resp["motion_errors"] = list(env.motion_log)
+                    elif cmd == "check_actions":
+                        resp = env.check_actions(msg["actions"],
+                                                 msg["perception"])
                     elif cmd == "step":
-                        resp = env.step(msg["action"],
-                                        msg.get("perception"),
-                                        msg.get("grasp_role", "target"))
+                        resp = env.step(msg["action"], msg.get("perception"),
+                                        msg.get("grasp_role", "target"),
+                                        bool(msg.get("require_ik", False)))
                     elif cmd == "ee":
                         resp = {"ee": env._ee_pos().tolist()}
                     elif cmd == "hover":
