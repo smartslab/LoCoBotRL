@@ -954,13 +954,19 @@ def build_route2(args):
         ws_x=(args.ws_x_min, args.ws_x_max),
         ws_y=(args.ws_y_min, args.ws_y_max),
         table_z=args.table_z, z_max=args.ws_z_max)
-    backend = perception4RL.make_backend(
-        args.perception, config, model_dir=args.model_dir)
-    anchor = tuple(float(v) for v in args.anchor.split(","))
-    route2 = perception4RL.Route2Perception(
-        backend, identity=args.identity, target_label=args.target_label,
-        anchor_xy=anchor, track_max=args.track_max, hue_tol=args.hue_tol,
+    options = dict(
+        identity=args.identity, target_label=args.target_label,
+        anchor_xy=tuple(float(v) for v in args.anchor.split(",")),
+        track_max=args.track_max, hue_tol=args.hue_tol,
         target_max_extent=args.target_max_extent)
+    if (args.perception == "segmentation"
+            and getattr(args, "perception_process", "worker") == "worker"):
+        route2 = perception4RL.PerceptionWorker(config, args.model_dir, **options)
+    else:
+        backend = perception4RL.make_backend(
+            args.perception, config, model_dir=args.model_dir)
+        route2 = perception4RL.Route2Perception(backend, **options)
+    backend = route2.backend
     if args.identity == "color":
         print("[route2] backend=%s identity=color target_label=%r"
               % (backend.name, args.target_label))
@@ -2327,6 +2333,10 @@ def main(argv=None):
                         help="off disables route 2 entirely: the server uses "
                              "its own point cloud and success falls back to "
                              "the gripper signal alone")
+    parser.add_argument("--perception_process", choices=["worker", "inprocess"],
+                        default="worker",
+                        help="run segmentation in a fresh interpreter or in "
+                             "the trainer; geometric mode runs in-process")
     parser.add_argument("--identity", choices=["color", "track"],
                         default="color",
                         help="how the target keeps its identity across "
@@ -2563,8 +2573,10 @@ def main(argv=None):
              if args.graspable_rule == "fingers" else
              "no obstacle point within %.0f mm of the target centre"
              % ((args.grasp_clearance or 0.06) * 1000)))
-    route2 = None if args.perception == "off" else build_route2(args)
+    route2 = None
     try:
+        if args.perception != "off":
+            route2 = build_route2(args)
         runner = EpisodeRunner(env, route2, dump_dir=args.dump_frames,
                                dump_every=args.dump_every,
                                grasp_trigger=args.grasp_trigger,
@@ -2588,8 +2600,37 @@ def main(argv=None):
                                allow_pick=bool(args.allow_pick))
         runner.masked_pushes = masked
         if args.ik_check_only:
-            runner.view = route2.start_episode(env.frame(), ee_xyz=None)
+            frame = env.frame()
+            print("[perception] " + perception4RL.frame_signature(frame))
+            capture_path = os.path.join(args.log_dir, "ik_frame.npz")
+            perception4RL.save_debug_frame(capture_path, frame, route2)
+            print("[perception] saved RGB-D capture to " + capture_path)
+            output = os.path.join(args.log_dir, "ik_perception.png")
+            runner.view = route2.start_episode(frame, debug_path=output)
+            view = runner.view
+            print("[perception] proposals=%d accepted=%d target_found=%s "
+                  "obstacles=%d depth_pixels=%d static_pixels=%s"
+                  % (view["proposal_count"], view["n_objects"],
+                     view["target_found"], len(view["obstacles"]),
+                     np.count_nonzero(frame["depth"]),
+                     frame.get("static_pixels")))
+            if view["target"] is not None:
+                print("[perception] target xyz=%s" %
+                      np.round(view["target"]["centroid"], 3).tolist())
+            for index, obstacle in enumerate(view["obstacles"], 1):
+                print("[perception] obstacle %d xyz=%s" %
+                      (index, np.round(obstacle["centroid"], 3).tolist()))
+
+            if view["debug_saved"]:
+                print("[perception] saved exact IK input frame to " + output)
+            else:
+                print("[perception] could not save " + output)
+
             menu, mask, _, perception, reasons = runner.checked_push_menu(None)
+            if not perception["pushables"]:
+                print("[IK] no pushable detections in this frame")
+            elif not mask.any():
+                print("[IK] all generated candidates were rejected")
             moves_per_object = len(PUSH_ANGLES) * len(PUSH_LENGTHS)
             for i in range(len(perception["pushables"]) * moves_per_object):
                 _, _, x, y, distance = menu[i]
@@ -2846,7 +2887,11 @@ def main(argv=None):
         print("[train] %s, %.1f min" % ("done" if finished else "ended early",
                                         (time.time() - start_time) / 60.0))
     finally:
-        env.close()
+        try:
+            if isinstance(route2, perception4RL.PerceptionWorker):
+                route2.close()
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":

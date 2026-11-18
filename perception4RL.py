@@ -2,12 +2,18 @@
 
 import argparse
 import base64
+import hashlib
+import io
 import json
 import os
 import socket
+import subprocess
+import sys
+import traceback
 import zlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -38,6 +44,44 @@ def decode_frame(reply):
     frame["intrinsics"] = np.asarray(reply["intrinsics"], dtype=float).reshape(3, 3)
     frame["cam_to_base"] = np.asarray(reply["cam_to_base"], dtype=float).reshape(4, 4)
     return frame
+
+
+def frame_signature(frame):
+    """Identify the actual camera data used for segmentation and geometry."""
+    return "rgb=%s depth=%s rgb_stamp=%s depth_stamp=%s" % (
+        hashlib.sha256(np.ascontiguousarray(frame["rgb"])).hexdigest()[:16],
+        hashlib.sha256(np.ascontiguousarray(frame["depth"])).hexdigest()[:16],
+        frame.get("rgb_stamp"), frame.get("depth_stamp"))
+
+
+def save_debug_frame(path, frame, perception):
+    """Save one decoded frame and its workspace and target settings for replay."""
+    options = {
+        "identity": perception.identity,
+        "target_label": perception.target_label,
+        "anchor_xy": perception.anchor.tolist(),
+        "track_max": perception.track_max,
+        "hue_tol": perception.hue_tol,
+        "target_max_extent": perception.target_max_extent,
+    }
+    metadata = {key: frame.get(key) for key in
+                ("rgb_stamp", "depth_stamp", "static_pixels")}
+    np.savez_compressed(
+        path, rgb=frame["rgb"], depth=frame["depth"],
+        intrinsics=frame["intrinsics"], cam_to_base=frame["cam_to_base"],
+        metadata=json.dumps(metadata),
+        config=json.dumps(asdict(perception.backend.config)),
+        options=json.dumps(options))
+
+
+def load_debug_frame(path):
+    with np.load(path, allow_pickle=False) as archive:
+        frame = json.loads(archive["metadata"].item())
+        for key in ("rgb", "depth", "intrinsics", "cam_to_base"):
+            frame[key] = archive[key]
+        config = PerceptionConfig(**json.loads(archive["config"].item()))
+        options = json.loads(archive["options"].item())
+    return frame, config, options
 
 
 def _camera_request(host, port, command):
@@ -128,6 +172,11 @@ class SegmentationBackend:
         self.predictor = Predictor(encoder, decoder)
         self.confidence = float(os.environ.get("YOLO_CONF", "0.50"))
         self.image_size = int(os.environ.get("YOLO_IMGSZ", "1280"))
+        print("[perception] module=%s YOLO weights=%s conf=%.3f imgsz=%d" % (
+            Path(__file__).resolve(), Path(weights).resolve(),
+            self.confidence, self.image_size))
+        print("[perception] NanoSAM encoder=%s decoder=%s" %
+              (Path(encoder).resolve(), Path(decoder).resolve()))
 
     def instances(self, frame):
         from PIL import Image
@@ -281,9 +330,13 @@ class Route2Perception:
             backend.last_accepted.append(dict(instance, **item))
         return detections, arm_blobs
 
-    def start_episode(self, frame, ee_xyz=None):
+    def start_episode(self, frame, ee_xyz=None, debug_path=None):
         self.target_xy = None
-        return self.perceive(frame, ee_xyz=ee_xyz)
+        view = self.perceive(frame, ee_xyz=ee_xyz)
+        if debug_path is not None:
+            overlay = render_perception_debug(frame, view, self.backend)
+            view["debug_saved"] = cv2.imwrite(debug_path, overlay)
+        return view
 
     def perceive(self, frame, ee_xyz=None):
         detections, arm_blobs = self._detect(frame, ee_xyz)
@@ -313,7 +366,8 @@ class Route2Perception:
                 "target_xy": None if target is None else target["centroid"][:2],
                 "target_source": self.identity if target is not None else "none",
                 "obstacles": obstacles[:4], "detections": detections,
-                "n_objects": len(detections), "arm_blobs": arm_blobs}
+                "n_objects": len(detections), "arm_blobs": arm_blobs,
+                "proposal_count": len(self.backend.last_instances)}
 
     def target_on_table(self, frame, exclude_xyz=None):
         detections, _ = self._detect(frame, exclude_xyz)
@@ -347,6 +401,117 @@ class Route2Perception:
                                               self.backend.config.table_z + 0.07))
                 confirmed_present = bool(keep.sum() >= self.backend.config.min_points)
         return {"target_on_table": bool(confirmed_present)}
+
+
+class PerceptionWorker(Route2Perception):
+    """Run segmentation in a fresh interpreter using a private local socket."""
+
+    def __init__(self, config, model_dir=None, **options):
+        super().__init__(SimpleNamespace(config=config, name="YOLO + NanoSAM worker"),
+                         **options)
+        self.channel, child = socket.socketpair()
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-u", str(Path(__file__).resolve()),
+                 "--worker-fd", str(child.fileno())],
+                pass_fds=(child.fileno(),))
+        except BaseException:
+            self.channel.close()
+            raise
+        finally:
+            child.close()
+        self.channel.settimeout(120)
+        self.stream = self.channel.makefile("rwb")
+        try:
+            self._request("init", config=asdict(config),
+                          model_dir=model_dir, options=options)
+        except BaseException:
+            self.close()
+            raise
+
+    def _request(self, command, frame=None, **fields):
+        payload = io.BytesIO()
+        if frame is not None:
+            np.savez(payload, **{key: frame[key] for key in
+                                 ("rgb", "depth", "intrinsics", "cam_to_base")})
+        data = payload.getbuffer()
+        request = dict(fields, command=command, size=len(data))
+        try:
+            self.stream.write((json.dumps(request) + "\n").encode("utf-8"))
+            self.stream.write(data)
+            self.stream.flush()
+            line = self.stream.readline()
+        except OSError as error:
+            raise RuntimeError("perception worker communication failed: %s" % error) from error
+        if not line:
+            raise RuntimeError("perception worker exited before replying to " + command)
+        response = json.loads(line)
+        if "error" in response:
+            raise RuntimeError("perception worker: " + response["error"])
+        return response["result"]
+
+    @staticmethod
+    def _xyz(value):
+        return None if value is None else np.asarray(value, dtype=float).tolist()
+
+    def start_episode(self, frame, ee_xyz=None, debug_path=None):
+        return self._request("start_episode", frame, ee_xyz=self._xyz(ee_xyz),
+                             debug_path=debug_path)
+
+    def perceive(self, frame, ee_xyz=None):
+        return self._request("perceive", frame, ee_xyz=self._xyz(ee_xyz))
+
+    def target_on_table(self, frame, exclude_xyz=None):
+        return self._request("target_on_table", frame, ee_xyz=self._xyz(exclude_xyz))
+
+    def close(self):
+        self.stream.close()
+        self.channel.close()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+
+
+def _serve_worker(fd):
+    perception = None
+    with socket.socket(fileno=fd) as channel, channel.makefile("rwb") as stream:
+        for line in iter(stream.readline, b""):
+            request = json.loads(line)
+            size = request["size"]
+            data = stream.read(size)
+            if len(data) != size:
+                break
+            command = request["command"]
+            try:
+                if command == "init":
+                    cfg = PerceptionConfig(**request["config"])
+                    backend = make_backend("segmentation", cfg, request["model_dir"])
+                    perception = Route2Perception(backend, **request["options"])
+                    result = None
+                else:
+                    with np.load(io.BytesIO(data), allow_pickle=False) as archive:
+                        frame = {key: archive[key] for key in archive.files}
+                    if command == "start_episode":
+                        result = perception.start_episode(frame, request["ee_xyz"],
+                                                          request["debug_path"])
+                    elif command == "perceive":
+                        result = perception.perceive(frame, request["ee_xyz"])
+                    elif command == "target_on_table":
+                        result = perception.target_on_table(frame, request["ee_xyz"])
+                    else:
+                        raise ValueError("unknown perception command: " + command)
+                response = {"result": result}
+            except Exception as error:
+                traceback.print_exc()
+                response = {"error": str(error)}
+            stream.write((json.dumps(response) + "\n").encode("utf-8"))
+            stream.flush()
 
 
 def xy_radius(extent):
@@ -472,6 +637,7 @@ def render_frame(frame, perception, backend, cfg, output_dir,
     rgb, depth = frame["rgb"], frame["depth"]
     print("\n========== CAMERA DEBUG ==========")
     print("RGB shape:", rgb.shape, "Depth shape:", depth.shape)
+    print("[perception] " + frame_signature(frame))
     print("Valid depth pixels:", np.count_nonzero(depth))
     print("Static pixels removed:", frame.get("static_pixels"))
     print("Camera-to-base transform:\n", frame["cam_to_base"])
@@ -576,6 +742,7 @@ def render_frame(frame, perception, backend, cfg, output_dir,
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--worker-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--host", default="locobot.local")
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--output-dir", default="debug_3d")
@@ -583,25 +750,37 @@ def main():
     parser.add_argument("--show-workspace", action="store_true")
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--model-dir", default=None)
+    parser.add_argument("--frame-file", help="replay an ik_frame.npz capture offline")
     args = parser.parse_args()
+    if args.worker_fd is not None:
+        _serve_worker(args.worker_fd)
+        return
     if args.count < 1:
         parser.error("--count must be positive")
+    if args.frame_file and args.count != 1:
+        parser.error("--frame-file takes one saved frame")
 
-    calibrated = _camera_request(args.host, args.port, "get_config")["config"]
-    cfg = PerceptionConfig(
-        ws_x=(calibrated["WS_X_MIN"], calibrated["WS_X_MAX"]),
-        ws_y=(calibrated["WS_Y_MIN"], calibrated["WS_Y_MAX"]),
-        table_z=calibrated["TABLE_Z"], z_max=calibrated["WS_Z_MAX"])
+    saved_frame = None
+    if args.frame_file:
+        saved_frame, cfg, options = load_debug_frame(args.frame_file)
+    else:
+        calibrated = _camera_request(args.host, args.port, "get_config")["config"]
+        cfg = PerceptionConfig(
+            ws_x=(calibrated["WS_X_MIN"], calibrated["WS_X_MAX"]),
+            ws_y=(calibrated["WS_Y_MIN"], calibrated["WS_Y_MAX"]),
+            table_z=calibrated["TABLE_Z"], z_max=calibrated["WS_Z_MAX"])
+        options = {"identity": "color", "target_label": "red_object",
+                   "target_max_extent": calibrated["TARGET_MAX_EXTENT"]}
+
     backend = make_backend("segmentation", cfg, model_dir=args.model_dir)
-    perception = Route2Perception(
-        backend, identity="color", target_label="red_object",
-        target_max_extent=calibrated["TARGET_MAX_EXTENT"])
+    perception = Route2Perception(backend, **options)
     for i in range(args.count):
         output_dir = args.output_dir
         if args.count > 1:
             output_dir = os.path.join(output_dir, "frame_%03d" % (i + 1))
         os.makedirs(output_dir, exist_ok=True)
-        frame = _debug_frame_from_server(args.host, args.port)
+        frame = saved_frame if saved_frame is not None else (
+            _debug_frame_from_server(args.host, args.port))
         render_frame(frame, perception, backend, cfg, output_dir,
                      args.show_3d, args.show_workspace)
 
