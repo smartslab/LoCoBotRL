@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """train_two_pipeline_clutter.py
 
+By default the trainer enumerates pushes and asks the robot for a solve-only
+IK mask before selecting a move with discrete SAC. Use --action_mode continuous
+for the original continuous push/pick policy and its existing checkpoints.
+
 Real-robot RL for target grasping in clutter. Runs on the TRAINING machine
 (Jetson, Python 3.8 + torch). The robot runs grasp_env_server_rgbd.py, which
 is a dumb executor: it moves the arm and reports the gripper state, and
@@ -19,7 +23,7 @@ Two pipelines from one RGB-D frame
       carries object-specific structure worth relearning. Feeding it
       pre-clustered centroids would strip exactly that out.
 
-  Route 2 -> execution and scoring.  route2_perception.py turns the same
+  Route 2 -> execution and scoring.  perception4RL.py turns the same
       frame into per-object centroids in the base frame. They tell the arm
       where to grasp or push, and they answer whether the target has left the
       table. Route 2 never enters the observation.
@@ -152,7 +156,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import route2_perception
+import perception4RL
 
 
 OBS_DIM = 45      # full server observation (protocol; unchanged)
@@ -167,6 +171,13 @@ OBS_DIM = 45      # full server observation (protocol; unchanged)
 # 5-D clearing action: push/pick selector, obstacle selector, push direction
 # (2), push distance. The target grasp is not an action; see the docstring.
 ACT_DIM = 5
+# Fixed slots give the actor output a consistent meaning. Perception fills
+# up to four obstacle slots plus an optional target. Within each slot, use
+# eight directions and three distances (2.5, 4.25, and 6 cm by default).
+PUSH_SLOTS = 5
+PUSH_ANGLES = tuple(i * np.pi / 4 for i in range(8))
+PUSH_LENGTHS = (-1.0, 0.0, 1.0)
+PUSH_MENU_SIZE = PUSH_SLOTS * len(PUSH_ANGLES) * len(PUSH_LENGTHS)
 
 # What the POLICY actually sees. The server's 45-D vector is proprioception
 # (5 joints + 3 EE + 1 gripper) followed by 36 perception entries (target
@@ -340,7 +351,14 @@ class RemoteEnv(object):
             print("[motion] during reset: %s" % reason)
         return self._observation(resp)
 
-    def step(self, action, perception=None, grasp_role="target"):
+    def check_actions(self, actions, perception):
+        result = self._send({"cmd": "check_actions",
+                             "actions": np.asarray(actions).tolist(),
+                             "perception": perception})
+        return np.asarray(result["mask"], dtype=bool), result["reasons"]
+
+    def step(self, action, perception=None, grasp_role="target",
+             require_ik=False):
         """Execute one primitive. `perception` carries route 2's centroids;
         the server acts on them. grasp_role: "obstacle" makes a[0] >= 0 a
         pick-and-place of obstacle a[1]; "target" makes it the planner
@@ -349,6 +367,8 @@ class RemoteEnv(object):
         msg = {"cmd": "step",
                "action": np.asarray(action, dtype=float).tolist(),
                "grasp_role": grasp_role}
+        if require_ik:
+            msg["require_ik"] = True
         if perception is not None:
             msg["perception"] = perception
         resp = self._send(msg)
@@ -357,7 +377,7 @@ class RemoteEnv(object):
 
     def frame(self):
         """One full-resolution frame for route 2. Moves nothing."""
-        return route2_perception.decode_frame(self._send({"cmd": "frame"}))
+        return perception4RL.decode_frame(self._send({"cmd": "frame"}))
 
     def home(self):
         """Move the arm to the episode home. Used once per episode, right
@@ -452,7 +472,10 @@ class FactoredQ(nn.Module):
             nn.Linear(hidden, 1))
 
     def forward(self, state, rgb, depth, action):
-        return self.head(self.phi_s(state, rgb, depth) * self.phi_a(action))
+        state_features = self.phi_s(state, rgb, depth)
+        if action.ndim == 3:
+            state_features = state_features.unsqueeze(1)
+        return self.head(state_features * self.phi_a(action))
 
 
 class Actor(nn.Module):
@@ -489,10 +512,31 @@ class Actor(nn.Module):
             return torch.tanh(mu + log_std.exp() * torch.randn_like(mu))
 
 
+class MaskedActor(nn.Module):
+    def __init__(self, visual_dim, depth_max_m, hidden=256):
+        super().__init__()
+        self.encoder = StateVisualEncoder(
+            PROPRIO_DIM, hidden, visual_dim, hidden, depth_max_m)
+        self.logits = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, PUSH_MENU_SIZE))
+
+    def distribution(self, state, rgb, depth, mask):
+        logits = self.logits(self.encoder(state, rgb, depth))
+        # Empty rows occur in terminal next observations. Replace their
+        # logits before softmax, then give every entry zero weight.
+        has_action = mask.any(dim=-1, keepdim=True)
+        masked = logits.masked_fill(~mask, float("-inf"))
+        masked = torch.where(has_action, masked, torch.zeros_like(logits))
+        logp = F.log_softmax(masked, dim=-1)
+        prob = logp.exp().masked_fill(~mask, 0.0)
+        return prob, logp.masked_fill(~mask, 0.0)
+
+
 # ---------------- replay and augmentation ----------------
 
 class Replay(object):
-    def __init__(self, capacity, state_dim, act_dim, image_shape):
+    def __init__(self, capacity, state_dim, act_dim, image_shape, masked=False):
         h, w = image_shape
         self.capacity = capacity
         self.state = np.zeros((capacity, state_dim), np.float32)
@@ -506,8 +550,16 @@ class Replay(object):
         self.done = np.zeros((capacity, 1), np.float32)
         self.n = 0
         self.i = 0
+        self.menus = {}
+        if masked:
+            for prefix in ("", "next_"):
+                self.menus[prefix + "menu"] = np.zeros(
+                    (capacity, PUSH_MENU_SIZE, ACT_DIM), np.float32)
+                self.menus[prefix + "mask"] = np.zeros(
+                    (capacity, PUSH_MENU_SIZE), bool)
 
-    def add(self, obs, action, reward, next_obs, done):
+    def add(self, obs, action, reward, next_obs, done,
+            menu=None, next_menu=None):
         """`done` must be 1 only when the task really ended (success, or
         the target left the table). An episode cut off by the step budget
         is stored with 0: the scene after it is an ordinary state and the
@@ -524,6 +576,9 @@ class Replay(object):
         self.next_rgb[i] = next_obs["rgb"]
         self.next_depth[i] = next_obs["depth"]
         self.done[i] = done
+        if self.menus:
+            self.menus["menu"][i], self.menus["mask"][i] = menu
+            self.menus["next_menu"][i], self.menus["next_mask"][i] = next_menu
         self.i = (i + 1) % self.capacity
         self.n = min(self.n + 1, self.capacity)
 
@@ -540,19 +595,26 @@ class Replay(object):
             depth=self.depth[:n], action=self.action[:n],
             reward=self.reward[:n], next_state=self.next_state[:n],
             next_rgb=self.next_rgb[:n], next_depth=self.next_depth[:n],
-            done=self.done[:n])
+            done=self.done[:n],
+            **{name: values[:n] for name, values in self.menus.items()})
         print("[train] saved %d transitions to %s" % (n, path))
 
     def load(self, path):
         """Refill the buffer from a file written by save()."""
-        data = np.load(path)
-        n = min(int(len(data["reward"])), self.capacity)
-        if data["rgb"].shape[1:] != self.rgb.shape[1:]:
-            raise ValueError("replay file image size %r does not match %r"
-                             % (data["rgb"].shape[1:], self.rgb.shape[1:]))
-        for name in ("state", "rgb", "depth", "action", "reward",
-                     "next_state", "next_rgb", "next_depth", "done"):
-            getattr(self, name)[:n] = data[name][-n:]
+        with np.load(path) as data:
+            has_masks = "mask" in data
+            if has_masks != bool(self.menus):
+                raise ValueError("replay action mode does not match this run")
+            total = len(data["reward"])
+            n = min(total, self.capacity)
+            if data["rgb"].shape[1:] != self.rgb.shape[1:]:
+                raise ValueError("replay file image size %r does not match %r"
+                                 % (data["rgb"].shape[1:], self.rgb.shape[1:]))
+            for name in ("state", "rgb", "depth", "action", "reward",
+                         "next_state", "next_rgb", "next_depth", "done"):
+                getattr(self, name)[:n] = data[name][total - n:]
+            for name, values in self.menus.items():
+                values[:n] = data[name][total - n:]
         self.n = n
         self.i = n % self.capacity
         print("[train] loaded %d transitions from %s" % (n, path))
@@ -566,7 +628,7 @@ class Replay(object):
 
     def sample(self, batch_size, device):
         idx = np.random.randint(0, self.n, size=batch_size)
-        return (self._tensor(self.state, idx, device),
+        batch = (self._tensor(self.state, idx, device),
                 self._tensor(self.rgb, idx, device).permute(0, 3, 1, 2),
                 self._tensor(self.depth, idx, device).unsqueeze(1),
                 self._tensor(self.action, idx, device),
@@ -575,6 +637,8 @@ class Replay(object):
                 self._tensor(self.next_rgb, idx, device).permute(0, 3, 1, 2),
                 self._tensor(self.next_depth, idx, device).unsqueeze(1),
                 self._tensor(self.done, idx, device))
+        return batch + tuple(torch.as_tensor(values[idx], device=device)
+                             for values in self.menus.values())
 
 
 def random_shift_pair(rgb, depth, pad):
@@ -620,7 +684,7 @@ def observation_tensors(obs, device):
 class SAC(object):
     def __init__(self, device, lr=3e-4, gamma=0.99, tau=0.005,
                  d=64, visual_dim=128, depth_max_m=1.5,
-                 freeze_phia=False, freeze_visual=False, aug_pad=4):
+                 freeze_phia=False, freeze_visual=False, aug_pad=4, masked=False):
         self.device = device
         self.gamma = gamma
         self.tau = tau
@@ -629,8 +693,10 @@ class SAC(object):
         self.freeze_visual = freeze_visual
         self.aug_pad = aug_pad
         net_args = (PROPRIO_DIM, ACT_DIM, d, 256, visual_dim, depth_max_m)
-        self.actor = Actor(
-            PROPRIO_DIM, ACT_DIM, 256, visual_dim, depth_max_m).to(device)
+        self.masked = masked
+        self.actor = (MaskedActor(visual_dim, depth_max_m) if masked else
+                      Actor(PROPRIO_DIM, ACT_DIM, 256, visual_dim,
+                            depth_max_m)).to(device)
         self.q1 = FactoredQ(*net_args).to(device)
         self.q2 = FactoredQ(*net_args).to(device)
         self.q1_target = FactoredQ(*net_args).to(device)
@@ -695,19 +761,33 @@ class SAC(object):
 
     def update(self, batch):
         (state, rgb, depth, action, reward, next_state, next_rgb,
-         next_depth, done) = batch
+         next_depth, done) = batch[:9]
         rgb, depth = random_shift_pair(rgb, depth, self.aug_pad)
         next_rgb, next_depth = random_shift_pair(
             next_rgb, next_depth, self.aug_pad)
 
         with torch.no_grad():
-            next_action, next_logp = self.actor.sample(
-                next_state, next_rgb, next_depth)
-            target_q = torch.min(
-                self.q1_target(next_state, next_rgb, next_depth, next_action),
-                self.q2_target(next_state, next_rgb, next_depth, next_action))
-            target = reward + self.gamma * (1.0 - done) * (
-                target_q - self.alpha * next_logp)
+            if self.masked:
+                menu, mask, next_menu, next_mask = batch[9:]
+                prob, next_logp = self.actor.distribution(
+                    next_state, next_rgb, next_depth, next_mask)
+                target_q = torch.min(
+                    self.q1_target(next_state, next_rgb, next_depth,
+                                   next_menu),
+                    self.q2_target(next_state, next_rgb, next_depth,
+                                   next_menu)).squeeze(-1)
+                next_value = (prob * (target_q - self.alpha * next_logp)
+                              ).sum(dim=-1, keepdim=True)
+            else:
+                next_action, next_logp = self.actor.sample(
+                    next_state, next_rgb, next_depth)
+                target_q = torch.min(
+                    self.q1_target(next_state, next_rgb, next_depth,
+                                   next_action),
+                    self.q2_target(next_state, next_rgb, next_depth,
+                                   next_action))
+                next_value = target_q - self.alpha * next_logp
+            target = reward + self.gamma * (1.0 - done) * next_value
 
         q1 = self.q1(state, rgb, depth, action)
         q2 = self.q2(state, rgb, depth, action)
@@ -721,11 +801,23 @@ class SAC(object):
             for critic in (self.q1, self.q2)]
         for critic in (self.q1, self.q2):
             critic.requires_grad_(False)
-        policy_action, logp = self.actor.sample(state, rgb, depth)
-        q_policy = torch.min(
-            self.q1(state, rgb, depth, policy_action),
-            self.q2(state, rgb, depth, policy_action))
-        loss_actor = (self.alpha.detach() * logp - q_policy).mean()
+        if self.masked:
+            prob, logp = self.actor.distribution(state, rgb, depth, mask)
+            q_policy = torch.min(
+                self.q1(state, rgb, depth, menu),
+                self.q2(state, rgb, depth, menu)).squeeze(-1)
+            loss_actor = (prob * (self.alpha.detach() * logp - q_policy)
+                          ).sum(dim=-1).mean()
+            entropy = -(prob * logp).sum(dim=-1)
+            target_entropy = 0.98 * mask.sum(dim=-1).clamp(min=1).float().log()
+            alpha_error = target_entropy - entropy.detach()
+        else:
+            policy_action, logp = self.actor.sample(state, rgb, depth)
+            q_policy = torch.min(
+                self.q1(state, rgb, depth, policy_action),
+                self.q2(state, rgb, depth, policy_action))
+            loss_actor = (self.alpha.detach() * logp - q_policy).mean()
+            alpha_error = logp.detach() + self.target_entropy
         self.opt_actor.zero_grad(set_to_none=True)
         loss_actor.backward()
         self.opt_actor.step()
@@ -733,8 +825,7 @@ class SAC(object):
             for param, requires_grad in zip(critic.parameters(), flags):
                 param.requires_grad_(requires_grad)
 
-        loss_alpha = -(
-            self.log_alpha * (logp.detach() + self.target_entropy)).mean()
+        loss_alpha = -(self.log_alpha * alpha_error).mean()
         self.opt_alpha.zero_grad(set_to_none=True)
         loss_alpha.backward()
         self.opt_alpha.step()
@@ -783,7 +874,7 @@ class SAC(object):
             os.makedirs(parent)
         temp = path + ".tmp"
         torch.save({
-            "format": "two_pipeline_clutter_v5",
+            "format": self.checkpoint_format,
             "actor": self.actor.state_dict(),
             "q1": self.q1.state_dict(),
             "q2": self.q2.state_dict(),
@@ -812,15 +903,18 @@ class SAC(object):
                   "optimizers fresh" % error)
             return False
 
+    @property
+    def checkpoint_format(self):
+        return ("two_pipeline_clutter_masked_push_v1" if self.masked
+                else "two_pipeline_clutter_v5")
+
     def load(self, path):
         checkpoint = torch.load(path, map_location=self.device)
-        if checkpoint.get("format") != "two_pipeline_clutter_v5":
-            raise ValueError(
-                "checkpoint format is %r, expected two_pipeline_clutter_v5. "
-                "v5 is the clearing-only MDP (5-D action, rule-triggered "
-                "planner grasp); earlier checkpoints have a different "
-                "action width and cannot be loaded"
-                % checkpoint.get("format"))
+        if checkpoint.get("format") != self.checkpoint_format:
+            raise ValueError("checkpoint format %r does not match %r; "
+                             "select the corresponding --action_mode"
+                             % (checkpoint.get("format"),
+                                self.checkpoint_format))
         self.actor.load_state_dict(checkpoint["actor"])
         self.q1.load_state_dict(checkpoint["q1"])
         self.q2.load_state_dict(checkpoint["q2"])
@@ -856,14 +950,14 @@ EPISODE_COLUMNS = [
 
 
 def build_route2(args):
-    config = route2_perception.PerceptionConfig(
+    config = perception4RL.PerceptionConfig(
         ws_x=(args.ws_x_min, args.ws_x_max),
         ws_y=(args.ws_y_min, args.ws_y_max),
-        table_z=args.table_z, z_max=args.table_z + 0.20)
-    backend = route2_perception.make_backend(
+        table_z=args.table_z, z_max=args.ws_z_max)
+    backend = perception4RL.make_backend(
         args.perception, config, model_dir=args.model_dir)
     anchor = tuple(float(v) for v in args.anchor.split(","))
-    route2 = route2_perception.Route2Perception(
+    route2 = perception4RL.Route2Perception(
         backend, identity=args.identity, target_label=args.target_label,
         anchor_xy=anchor, track_max=args.track_max, hue_tol=args.hue_tol,
         target_max_extent=args.target_max_extent)
@@ -915,6 +1009,7 @@ class EpisodeRunner(object):
         self.home_each_step = bool(home_each_step)
         self.grasp_retries = max(0, int(grasp_retries))
         self.max_blind_episodes = int(max_blind_episodes)
+        self.masked_pushes = False
         self.view = None            # clean route-2 view the last step ended on
         self.home_state = None      # proprioception with the arm parked
         self.image_size = None
@@ -1033,7 +1128,7 @@ class EpisodeRunner(object):
         for d in view.get("detections") or []:
             distance = float(np.linalg.norm(
                 np.asarray(d["centroid"][:2], dtype=float) - xy))
-            if distance - route2_perception.xy_radius(d["extent"]) < gap:
+            if distance - perception4RL.xy_radius(d["extent"]) < gap:
                 return True
         return False
 
@@ -1261,7 +1356,7 @@ class EpisodeRunner(object):
             # piece of it): its own radius + the commanded push + 3 cm
             carry = float(info.get("push_distance") or 0.0) \
                 if primitive == "push" else 0.0
-            allowed = (route2_perception.xy_radius(acted_object["extent"])
+            allowed = (perception4RL.xy_radius(acted_object["extent"])
                        + carry + 0.03)
         if acted_object is not None and not acted_is_target:
             # Where the acted-on object should be now: at the drop point
@@ -1358,13 +1453,13 @@ class EpisodeRunner(object):
 
         # ---- progress toward a graspable target ----
         if tb is not None and ta is not None:
-            cb = route2_perception.grasp_clearance(
+            cb = perception4RL.grasp_clearance(
                 tb, before.get("obstacles", []))
             # An obstacle that left the table must not count as "cleared":
             # for this term it stays where it was. Otherwise knocking the
             # nearest block off the table earned up to +1.6 of clearance
             # against a loss charge of 1.0.
-            ca = route2_perception.grasp_clearance(
+            ca = perception4RL.grasp_clearance(
                 ta, obs_a + lost_objects)
             # Pay only for the space the grasp needs (the grasp circle plus
             # 2 cm). Pushing an obstacle far beyond that earns nothing
@@ -1426,7 +1521,7 @@ class EpisodeRunner(object):
         return -(self.w["pose_edge"] * edge + self.w["pose_angle"] * angle)
 
     def _feasibility(self, view):
-        return route2_perception.grasp_feasibility(
+        return perception4RL.grasp_feasibility(
             view, clearance_min=self.clearance_min,
             max_radial=self.max_radial, min_radial=self.min_radial)
 
@@ -1497,7 +1592,7 @@ class EpisodeRunner(object):
         while True:
             obs = self.env.reset()
             used_up = self.last_end in (None, "success", "target_lost",
-                                        "outreach", "cleanup")
+                                        "outreach", "cleanup", "no_feasible")
             if first and (self.reset_prompt >= 2
                           or (self.reset_prompt == 1 and used_up)):
                 pointing = self._point_at_anchor()
@@ -1523,6 +1618,10 @@ class EpisodeRunner(object):
                     self._dump_frame(frame, "reset_%05d" % self._dump_count)
                     summary = self.route2.start_episode(
                         frame, ee_xyz=obs["state"][5:8])
+                    if self.masked_pushes:
+                        obs["rgb"] = center_crop_resize(frame["rgb"], self.image_size)
+                        obs["depth"] = center_crop_resize(
+                            frame.get("depth_raw", frame["depth"]), self.image_size)
                     problem = self._start_problem(summary)
                     self._print_start(summary)
                 except Exception as error:
@@ -1553,7 +1652,8 @@ class EpisodeRunner(object):
                 break
             # a human touched the scene: what was true of it no longer is
             self.last_end, self.blind_episodes = None, 0
-        self.view = summary if (summary and self.home_each_step) else None
+        self.view = summary if (summary and (self.home_each_step
+                                             or self.masked_pushes)) else None
         self.saw_target = bool(summary.get("target_found"))
         self.started_graspable = problem == "graspable"
         self.failed_grasp_xy = None
@@ -1578,13 +1678,14 @@ class EpisodeRunner(object):
                  "already graspable" if feas["graspable"]
                  else "not graspable (%s)" % feas["reason"]))
 
-    def _end_episode(self, end):
+    def _end_episode(self, end, keep_view=False):
         """Book-keeping the next start_episode needs."""
         self.last_end = end
         self.ep_refused = 0
         self.blind_episodes = (0 if self.saw_target or end == "success"
                                else self.blind_episodes + 1)
-        self.view = None
+        if not keep_view:
+            self.view = None
 
     def _planner_grasp(self, view, obs):
         """Run the scripted grasp of the target and decide success.
@@ -1616,7 +1717,49 @@ class EpisodeRunner(object):
                       "as a failure" % error)
         return next_obs, done, success, held, target_on_table, info
 
-    def step(self, action, ee_xyz=None):
+    def checked_push_menu(self, obs):
+        """Build fixed push slots and check them against one Route 2 view."""
+        before = self.view
+        if not before:
+            ee_xyz = None if obs is None else obs["state"][5:8]
+            before = self._perceive(ee_xyz, "ik_candidates")
+        pool = self._pushables(before)[:PUSH_SLOTS if PUSH_RED else PUSH_SLOTS - 1]
+        perception = {"target": before["target"],
+                      "obstacles": before["obstacles"],
+                      "pushables": pool}
+        menu = np.zeros((PUSH_MENU_SIZE, ACT_DIM), dtype=np.float32)
+        mask = np.zeros(PUSH_MENU_SIZE, dtype=bool)
+        reasons = []
+        if pool:
+            candidates = [
+                (-1.0, 2.0 * (idx + 0.5) / len(pool) - 1.0,
+                 np.cos(angle), np.sin(angle), distance)
+                for idx in range(len(pool))
+                for angle in PUSH_ANGLES for distance in PUSH_LENGTHS
+            ]
+            count = len(candidates)
+            menu[:count] = candidates
+            commands = np.array([
+                self._server_action(action, perception) for action in menu[:count]
+            ])
+            valid, reasons = self.env.check_actions(commands, perception)
+            if valid.shape != (count,) or len(reasons) != count:
+                raise RuntimeError("server returned an invalid IK action mask")
+            mask[:count] = valid
+        if self.verbose:
+            print("[IK] %d/%d pushes passed%s" % (
+                mask.sum(), len(reasons),
+                ("; " + ", ".join(sorted(set(filter(None, reasons)))))
+                if not mask.any() and reasons else ""))
+        return menu, mask, before, perception, reasons
+
+    def _server_action(self, action, perception):
+        command = np.asarray(action, dtype=float).copy()
+        if self.push_frame == "relative" and perception.get("pushables"):
+            command[2:4] = self._world_direction(action, perception)
+        return command
+
+    def step(self, action, ee_xyz=None, checked=None):
         """One clearing action, then the rule-triggered grasp if it
         applies. Returns (next_obs, reward, done, record).
 
@@ -1637,7 +1780,9 @@ class EpisodeRunner(object):
         if not self.allow_pick:
             to_server[0] = -1.0
         perception, before = None, {}
-        if self.route2 is not None:
+        if checked is not None:
+            _, _, before, perception, _ = checked
+        elif self.route2 is not None:
             try:
                 if self.home_each_step and self.view is not None:
                     # the clean picture the last step ended on IS this
@@ -1655,7 +1800,7 @@ class EpisodeRunner(object):
 
         if (not is_pick and self.push_frame == "relative" and perception
                 and perception.get("pushables")):
-            to_server[2:4] = self._world_direction(action, perception)
+            to_server = self._server_action(to_server, perception)
 
         after, clean = None, False
         shaping, shaping_terms = 0.0, {}
@@ -1754,7 +1899,8 @@ class EpisodeRunner(object):
         else:
             next_obs, done, info = self.env.step(
                 to_server, perception,
-                grasp_role="obstacle" if is_pick else "target")
+                grasp_role="obstacle" if is_pick else "target",
+                require_ik=checked is not None)
             for reason in info.get("motion_errors", []):
                 print("[motion] %s" % reason)
             reward = -STEP_COST
@@ -1887,7 +2033,9 @@ class EpisodeRunner(object):
             self._end_episode("success" if success else
                               "target_lost" if target_lost else
                               "outreach" if outreach_hit else
-                              "cleanup" if cleanup_end else "time_limit")
+                              "cleanup" if cleanup_end else "time_limit",
+                              keep_view=checked is not None and not terminal
+                              and not cleanup_end)
 
         # Displacement of the obstacle the action was applied to: the
         # "what did this push/pick do" data for the action-side invariance
@@ -1957,6 +2105,32 @@ class EpisodeRunner(object):
 
 # ---------------- training and evaluation ----------------
 
+def select_checked(agent, runner, obs, checked, explore=False,
+                   demo=False, deterministic=False):
+    menu, mask = checked[:2]
+    feasible = np.flatnonzero(mask)
+    if demo:
+        nominal = runner.scripted_action(noise=0.0)
+        index = feasible[np.argmin(
+            np.sum((menu[feasible, 1:] - nominal[1:]) ** 2, axis=1))]
+    elif explore:
+        index = np.random.choice(feasible)
+    else:
+        with torch.no_grad():
+            state, rgb, depth = observation_tensors(obs, agent.device)
+            prob, _ = agent.actor.distribution(
+                state, rgb, depth,
+                torch.as_tensor(mask[None], device=agent.device))
+            index = (prob.argmax(dim=-1) if deterministic else
+                     torch.multinomial(prob, 1)).item()
+    return menu[index]
+
+
+def empty_push_menu():
+    return (np.zeros((PUSH_MENU_SIZE, ACT_DIM), dtype=np.float32),
+            np.zeros(PUSH_MENU_SIZE, dtype=bool))
+
+
 def run_eval(args, agent, runner, device, obs):
     path = os.path.join(args.log_dir, "eval_episodes.csv")
     with open(path, "a", newline="") as eval_file:
@@ -1971,11 +2145,19 @@ def run_eval(args, agent, runner, device, obs):
             grasps, pushes, success = 0, 0, False
             done = False
             while not done:
-                state, rgb, depth = observation_tensors(obs, device)
-                action = agent.actor.act(
-                    state, rgb, depth, deterministic=True)[0]
+                checked = runner.checked_push_menu(obs) if agent.masked else None
+                if checked is not None:
+                    if not checked[1].any():
+                        runner._end_episode("no_feasible")
+                        break
+                    action = select_checked(agent, runner, obs, checked,
+                                            deterministic=True)
+                else:
+                    state, rgb, depth = observation_tensors(obs, device)
+                    action = agent.actor.act(
+                        state, rgb, depth, deterministic=True)[0].cpu().numpy()
                 obs, reward, done, record = runner.step(
-                    action.cpu().numpy(), ee_xyz=obs["state"][5:8])
+                    action, ee_xyz=obs["state"][5:8], checked=checked)
                 episode_return += reward
                 length += 1
                 grasps += int(record["auto_grasp"]
@@ -2065,6 +2247,7 @@ def params_from_server(env, args):
             if given is None:
                 setattr(args, flag, fallback)
                 missing.append(key)
+    args.ws_z_max = float(config.get("WS_Z_MAX", args.table_z + 0.20))
     if "TARGET_X" in config and "TARGET_Y" in config:
         anchor = (float(config["TARGET_X"]), float(config["TARGET_Y"]))
         if args.anchor is not None:
@@ -2122,6 +2305,12 @@ def main(argv=None):
     parser.add_argument("--aug_pad", type=int, default=4,
                         help="DrQ random-shift padding; 0 disables it")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--action_mode", choices=["ik", "continuous"],
+                        default="ik", help="IK-masked discrete pushes or "
+                        "the original continuous push/pick policy")
+    parser.add_argument("--ik_check_only", action="store_true",
+                        help="read the current frame and print the IK menu "
+                        "without resetting or moving the robot")
     parser.add_argument("--eval", type=int, default=0)
     parser.add_argument("--episodes", type=int, default=20)
     # transfer experiment hooks
@@ -2313,7 +2502,15 @@ def main(argv=None):
                              "--save_replay). Implied by --resume 1.")
     args = parser.parse_args(argv)
 
-    if not args.eval and args.steps is None:
+    masked = args.action_mode == "ik"
+    if masked:
+        if args.perception == "off" or args.grasp_trigger != "auto":
+            parser.error("IK mode needs Route 2 perception and auto grasp")
+        args.allow_pick = 0
+        args.home_each_step = 1
+    if args.ik_check_only and not masked:
+        parser.error("--ik_check_only needs --action_mode ik")
+    if not args.ik_check_only and not args.eval and args.steps is None:
         parser.error("--steps is required for training")
     if args.eval and not args.load:
         parser.error("--eval 1 requires --load <checkpoint>")
@@ -2329,6 +2526,9 @@ def main(argv=None):
     global PUSH_RED
     PUSH_RED = bool(args.push_red)
     env = RemoteEnv(args.host, args.port)
+    if masked and not env._send({"cmd": "ping"}).get("check_actions"):
+        env.close()
+        parser.error("IK mode requires the updated server with check_actions")
     params_from_server(env, args)
     ax, ay = (float(v) for v in args.anchor.split(","))
     args.scene = args.scene.replace(
@@ -2352,7 +2552,7 @@ def main(argv=None):
              args.allow_pick,
              "n/a" if args.one_action else args.grasp_retries, args.resume))
 
-    route2_perception.set_grasp_rule(args.graspable_rule,
+    perception4RL.set_grasp_rule(args.graspable_rule,
                                      args.finger_half_width)
     print("[train] graspable rule: %s (%s)"
           % (args.graspable_rule,
@@ -2386,6 +2586,18 @@ def main(argv=None):
                                max_blind_episodes=args.max_blind_episodes,
                                one_action=bool(args.one_action),
                                allow_pick=bool(args.allow_pick))
+        runner.masked_pushes = masked
+        if args.ik_check_only:
+            runner.view = route2.start_episode(env.frame(), ee_xyz=None)
+            menu, mask, _, perception, reasons = runner.checked_push_menu(None)
+            moves_per_object = len(PUSH_ANGLES) * len(PUSH_LENGTHS)
+            for i in range(len(perception["pushables"]) * moves_per_object):
+                _, _, x, y, distance = menu[i]
+                print("object=%d %s_direction=(%.2f, %.2f) "
+                      "distance_action=%.2f %s" %
+                      (i // moves_per_object + 1, args.push_frame, x, y, distance,
+                       "PASS" if mask[i] else "REJECT (" + reasons[i] + ")"))
+            return
         try:
             obs, _ = runner.start_episode()
         except StopTraining as stop:
@@ -2405,7 +2617,7 @@ def main(argv=None):
                     depth_max_m=args.depth_max_m,
                     freeze_phia=bool(args.freeze_phia),
                     freeze_visual=bool(args.freeze_visual),
-                    aug_pad=args.aug_pad)
+                    aug_pad=args.aug_pad, masked=masked)
         checkpoint = None
         if args.load:
             checkpoint = agent.load(args.load)
@@ -2432,7 +2644,8 @@ def main(argv=None):
                 print("[eval] %s" % stop)
             return
 
-        replay = Replay(args.replay_size, PROPRIO_DIM, ACT_DIM, image_shape)
+        replay = Replay(args.replay_size, PROPRIO_DIM, ACT_DIM, image_shape,
+                        masked=masked)
         if args.load_replay:
             replay.load(args.load_replay)
         # random steps still owed: none for a new phase from stored weights
@@ -2479,10 +2692,35 @@ def main(argv=None):
             os.path.join(args.log_dir, "episodes.csv"), EPISODE_COLUMNS)
         finished = False
         try:
+            checked = None
             for step in range(step0 + 1, step0 + args.steps + 1):
+                if masked and checked is None:
+                    checked = runner.checked_push_menu(obs)
+                while checked is not None and not checked[1].any():
+                    runner._end_episode("no_feasible")
+                    print("[IK] no feasible push in this scene")
+                    episode_writer.writerow([
+                        time.time(), step - 1, episode_i, episode_return,
+                        episode_length, 0, grasps, pushes, "no_feasible",
+                        int(runner.started_graspable)])
+                    episode_file.flush()
+                    if not args.reset_prompt:
+                        raise StopTraining("rearrange the blocks and resume")
+                    # A new scene may have a feasible path. No step or
+                    # transition has been consumed by an empty menu.
+                    episode_i += 1
+                    episode_return, episode_length = 0.0, 0
+                    grasps, pushes = 0, 0
+                    obs, _ = runner.start_episode()
+                    checked = runner.checked_push_menu(obs)
                 if demo_left > 0:
-                    action = runner.scripted_action()
                     warmup = max(warmup, step)   # no updates yet
+                if checked is not None:
+                    action = select_checked(
+                        agent, runner, obs, checked, explore=step <= warmup,
+                        demo=demo_left > 0)
+                elif demo_left > 0:
+                    action = runner.scripted_action()
                 elif step <= warmup:
                     action = np.random.uniform(
                         -1, 1, ACT_DIM).astype(np.float32)
@@ -2492,10 +2730,25 @@ def main(argv=None):
                         state, rgb, depth)[0].cpu().numpy()
 
                 next_obs, reward, done, record = runner.step(
-                    action, ee_xyz=obs["state"][5:8])
-                # terminal, not done: see Replay.add
-                replay.add(obs, action, reward, next_obs,
-                           float(record["terminal"]))
+                    action, ee_xyz=obs["state"][5:8], checked=checked)
+                if masked:
+                    next_checked = None
+                    if not record["terminal"] and record["end"] != "cleanup":
+                        next_checked = runner.checked_push_menu(next_obs)
+                        if not next_checked[1].any():
+                            done = record["terminal"] = True
+                            record["end"] = "no_feasible"
+                            runner._end_episode("no_feasible")
+                    if record["primitive"] == "push":
+                        replay.add(
+                            obs, action, reward, next_obs,
+                            float(record["terminal"]), menu=checked[:2],
+                            next_menu=(next_checked[:2] if next_checked
+                                       is not None else empty_push_menu()))
+                    checked = None if done else next_checked
+                else:
+                    replay.add(obs, action, reward, next_obs,
+                               float(record["terminal"]))
                 episode_return += reward
                 episode_length += 1
                 grasps += int(record["auto_grasp"]
