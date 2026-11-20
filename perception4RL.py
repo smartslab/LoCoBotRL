@@ -338,10 +338,13 @@ class Route2Perception:
             overlay = render_perception_debug(frame, view, self.backend)
             view["debug_saved"] = cv2.imwrite(debug_path, overlay)
             path = Path(debug_path)
+            target_path = path.with_name(path.stem + "_target_rgbd.png")
+            view["target_rgbd_saved"] = cv2.imwrite(
+                str(target_path), render_target_rgbd_debug(frame, view, self.backend))
             clearance_path = path.with_name(path.stem + "_clearance.png")
             view["clearance_debug_saved"] = cv2.imwrite(
                 str(clearance_path),
-                render_clearance_debug(frame, view, self.backend.config))
+                render_clearance_debug(frame, view, self.backend))
         return view
 
     def perceive(self, frame, ee_xyz=None):
@@ -613,30 +616,109 @@ def render_perception_debug(frame, view, backend):
     return overlay
 
 
-def render_clearance_debug(frame, view, cfg):
-    """Project the base_link XY clearance ring onto the full-resolution RGB."""
+def _base_to_rgb_pixels(frame, points):
+    base_to_cam = np.linalg.inv(frame["cam_to_base"])
+    camera_points = points @ base_to_cam[:3, :3].T + base_to_cam[:3, 3]
+    if not np.isfinite(camera_points).all() or (camera_points[:, 2] <= 1e-6).any():
+        return None
+    homogeneous = camera_points @ frame["intrinsics"].T
+    pixels = homogeneous[:, :2] / homogeneous[:, 2:3]
+    if not np.isfinite(pixels).all() or (np.abs(pixels) >= 2**30).any():
+        return None
+    return np.rint(pixels).astype(np.int32)
+
+
+def _debug_instance_pixels(frame, mask, cfg):
+    depth = frame["depth"]
+    rows, cols = np.nonzero(mask & (depth > 0))
+    points = _project_pixels(depth, frame["intrinsics"], frame["cam_to_base"],
+                             rows, cols)
+    keep = cfg.crop_mask(points)
+    return rows[keep], cols[keep], points[keep]
+
+
+def _target_instance(view, backend):
+    target = view.get("target")
+    if target is None:
+        return None
+    # _detect stores a shallow copy, so this identifies the exact detection.
+    return next((instance for instance in backend.last_accepted
+                 if instance["centroid"] is target["centroid"]), None)
+
+
+def render_target_rgbd_debug(frame, view, backend):
+    """Show only the RGB and depth samples used to compute the target centroid."""
+    rgb = np.zeros_like(frame["rgb"])
+    depth_image = np.zeros_like(rgb)
+    label = "Target not detected"
+    depth_label = ""
+    instance = _target_instance(view, backend)
+    if instance is not None:
+        rows, cols, _ = _debug_instance_pixels(frame, instance["mask"],
+                                               backend.config)
+        rgb[rows, cols] = frame["rgb"][rows, cols, ::-1]
+        depth = frame["depth"][rows, cols].astype(float)
+        low, high = depth.min(), depth.max()
+        scaled = np.rint((depth - low) * 255 / max(high - low, 1)).astype(np.uint8)
+        depth_image[rows, cols] = cv2.applyColorMap(scaled, cv2.COLORMAP_VIRIDIS)[:, 0]
+        centroid = np.asarray(view["target"]["centroid"])
+        label = "base_link centroid (m): X %.3f   Y %.3f   Z %.3f" % tuple(centroid)
+        depth_label = "Depth: %.0f to %.0f mm" % (low, high)
+        pixels = _base_to_rgb_pixels(frame, centroid.reshape(1, 3))
+        if pixels is not None:
+            for image in (rgb, depth_image):
+                cv2.drawMarker(image, tuple(pixels[0]), (0, 255, 255),
+                               cv2.MARKER_CROSS, 15, 2, cv2.LINE_AA)
+        top, bottom = max(0, rows.min() - 12), rows.max() + 13
+        left, right = max(0, cols.min() - 12), cols.max() + 13
+        rgb = rgb[top:bottom, left:right]
+        depth_image = depth_image[top:bottom, left:right]
+
+    height, width = rgb.shape[:2]
+    panel_width = max(230, width)
+    canvas = np.zeros((height + 56, 2 * panel_width + 8, 3), dtype=np.uint8)
+    for index, (image, heading) in enumerate(((rgb, "Target RGB"),
+                                             (depth_image, depth_label or "Target depth"))):
+        start = index * (panel_width + 8)
+        offset = start + (panel_width - width) // 2
+        canvas[56:, offset:offset + width] = image
+        cv2.putText(canvas, heading, (start + 8, 45), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
+def render_clearance_debug(frame, view, backend):
+    """Overlay the base_link XY ring and observed obstacle points inside it."""
     overlay = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
+    cfg = backend.config
     target = view.get("target")
     label = "Clearance circle: target not detected"
     if target is not None:
         x, y = target["centroid"][:2]
         theta = np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False)
         radius = cfg.grasp_clearance
+        target_instance = _target_instance(view, backend)
+        obstacle_mask = np.zeros(frame["depth"].shape, dtype=bool)
+        for instance in backend.last_accepted:
+            if instance is not target_instance:
+                obstacle_mask |= instance["mask"]
+        if target_instance is not None:
+            obstacle_mask &= ~target_instance["mask"]
+        rows, cols, points = _debug_instance_pixels(frame, obstacle_mask, cfg)
+        inside = (points[:, 0] - x)**2 + (points[:, 1] - y)**2 < radius**2
+        overlay[rows[inside], cols[inside]] = (255, 0, 255)
         ring_base = np.column_stack((x + radius * np.cos(theta),
                                      y + radius * np.sin(theta),
-                                     np.full(theta.shape, cfg.table_z),
-                                     np.ones(theta.shape)))
-        base_to_cam = np.linalg.inv(frame["cam_to_base"])
-        ring_cam = (ring_base @ base_to_cam.T)[:, :3]
+                                     np.full(theta.shape, cfg.table_z)))
+        polygon = _base_to_rgb_pixels(frame, ring_base)
         label = "Clearance circle: projection unavailable"
-        if np.isfinite(ring_cam).all() and (ring_cam[:, 2] > 1e-6).all():
-            homogeneous = ring_cam @ frame["intrinsics"].T
-            pixels = homogeneous[:, :2] / homogeneous[:, 2:3]
-            if np.isfinite(pixels).all() and (np.abs(pixels) < 2**30).all():
-                polygon = np.rint(pixels).astype(np.int32)
-                cv2.polylines(overlay, [polygon], True, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.polylines(overlay, [polygon], True, (0, 255, 255), 2, cv2.LINE_AA)
-                label = "Clearance circle: %.0f mm radius" % (1000.0 * radius)
+        if polygon is not None:
+            cv2.polylines(overlay, [polygon], True, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.polylines(overlay, [polygon], True, (0, 255, 255), 2, cv2.LINE_AA)
+            label = "Radius %.0f mm | Obstacle depth pixels inside: %d" % (
+                1000.0 * radius, np.count_nonzero(inside))
     for color, thickness in [((0, 0, 0), 3), ((0, 255, 255), 1)]:
         cv2.putText(overlay, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, color, thickness, cv2.LINE_AA)
@@ -686,8 +768,11 @@ def render_frame(frame, perception, backend, cfg, output_dir,
     rgb_path = os.path.join(output_dir, "rgb_debug.png")
     if not cv2.imwrite(rgb_path, render_perception_debug(frame, view, backend)):
         raise OSError("Could not write " + rgb_path)
+    target_path = os.path.join(output_dir, "target_rgbd.png")
+    if not cv2.imwrite(target_path, render_target_rgbd_debug(frame, view, backend)):
+        raise OSError("Could not write " + target_path)
     clearance_path = os.path.join(output_dir, "rgb_clearance.png")
-    if not cv2.imwrite(clearance_path, render_clearance_debug(frame, view, cfg)):
+    if not cv2.imwrite(clearance_path, render_clearance_debug(frame, view, backend)):
         raise OSError("Could not write " + clearance_path)
 
     fig = plt.figure(figsize=(12, 9))
@@ -774,6 +859,7 @@ def render_frame(frame, perception, backend, cfg, output_dir,
     fig.savefig(cloud_path, dpi=140)
     print("\nSaved 3D image:", cloud_path)
     print("Saved 2D image:", rgb_path)
+    print("Saved target RGB-D image:", target_path)
     print("Saved clearance overlay:", clearance_path)
     if show_3d:
         plt.show()
