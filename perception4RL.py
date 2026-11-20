@@ -125,6 +125,7 @@ class PerceptionConfig:
     z_max: float = 0.425
     table_cut: float = 0.008
     min_points: int = 25
+    grasp_clearance: float = 0.06
 
     def crop_mask(self, xyz):
         return (np.isfinite(xyz).all(axis=1)
@@ -336,6 +337,11 @@ class Route2Perception:
         if debug_path is not None:
             overlay = render_perception_debug(frame, view, self.backend)
             view["debug_saved"] = cv2.imwrite(debug_path, overlay)
+            path = Path(debug_path)
+            clearance_path = path.with_name(path.stem + "_clearance.png")
+            view["clearance_debug_saved"] = cv2.imwrite(
+                str(clearance_path),
+                render_clearance_debug(frame, view, self.backend.config))
         return view
 
     def perceive(self, frame, ee_xyz=None):
@@ -607,6 +613,36 @@ def render_perception_debug(frame, view, backend):
     return overlay
 
 
+def render_clearance_debug(frame, view, cfg):
+    """Project the base_link XY clearance ring onto the full-resolution RGB."""
+    overlay = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
+    target = view.get("target")
+    label = "Clearance circle: target not detected"
+    if target is not None:
+        x, y = target["centroid"][:2]
+        theta = np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False)
+        radius = cfg.grasp_clearance
+        ring_base = np.column_stack((x + radius * np.cos(theta),
+                                     y + radius * np.sin(theta),
+                                     np.full(theta.shape, cfg.table_z),
+                                     np.ones(theta.shape)))
+        base_to_cam = np.linalg.inv(frame["cam_to_base"])
+        ring_cam = (ring_base @ base_to_cam.T)[:, :3]
+        label = "Clearance circle: projection unavailable"
+        if np.isfinite(ring_cam).all() and (ring_cam[:, 2] > 1e-6).all():
+            homogeneous = ring_cam @ frame["intrinsics"].T
+            pixels = homogeneous[:, :2] / homogeneous[:, 2:3]
+            if np.isfinite(pixels).all() and (np.abs(pixels) < 2**30).all():
+                polygon = np.rint(pixels).astype(np.int32)
+                cv2.polylines(overlay, [polygon], True, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.polylines(overlay, [polygon], True, (0, 255, 255), 2, cv2.LINE_AA)
+                label = "Clearance circle: %.0f mm radius" % (1000.0 * radius)
+    for color, thickness in [((0, 0, 0), 3), ((0, 255, 255), 1)]:
+        cv2.putText(overlay, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, color, thickness, cv2.LINE_AA)
+    return overlay
+
+
 def draw_workspace(ax, cfg):
     x0, x1 = cfg.ws_x
     y0, y1 = cfg.ws_y
@@ -650,6 +686,9 @@ def render_frame(frame, perception, backend, cfg, output_dir,
     rgb_path = os.path.join(output_dir, "rgb_debug.png")
     if not cv2.imwrite(rgb_path, render_perception_debug(frame, view, backend)):
         raise OSError("Could not write " + rgb_path)
+    clearance_path = os.path.join(output_dir, "rgb_clearance.png")
+    if not cv2.imwrite(clearance_path, render_clearance_debug(frame, view, cfg)):
+        raise OSError("Could not write " + clearance_path)
 
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
@@ -735,6 +774,7 @@ def render_frame(frame, perception, backend, cfg, output_dir,
     fig.savefig(cloud_path, dpi=140)
     print("\nSaved 3D image:", cloud_path)
     print("Saved 2D image:", rgb_path)
+    print("Saved clearance overlay:", clearance_path)
     if show_3d:
         plt.show()
     plt.close(fig)
@@ -768,7 +808,8 @@ def main():
         cfg = PerceptionConfig(
             ws_x=(calibrated["WS_X_MIN"], calibrated["WS_X_MAX"]),
             ws_y=(calibrated["WS_Y_MIN"], calibrated["WS_Y_MAX"]),
-            table_z=calibrated["TABLE_Z"], z_max=calibrated["WS_Z_MAX"])
+            table_z=calibrated["TABLE_Z"], z_max=calibrated["WS_Z_MAX"],
+            grasp_clearance=calibrated.get("GRASP_CLEARANCE", 0.06))
         options = {"identity": "color", "target_label": "red_object",
                    "target_max_extent": calibrated["TARGET_MAX_EXTENT"]}
 
